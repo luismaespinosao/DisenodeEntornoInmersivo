@@ -1,7 +1,0 @@
-prueba,indicador,n,media,mediana,desv_est,min,max
-Prueba 1,SUS (0-100),5,83.5,85.0,8.4,72.5,92.5
-Prueba 1,VRSUQ promedio (1-5),5,4.27,4.33,0.37,3.89,4.67
-Prueba 2,SUS (0-100),10,86.25,88.75,12.03,62.5,100.0
-Prueba 2,VRSUQ promedio (1-5),10,4.39,4.5,0.47,3.67,4.89
-Prueba 2,Aciertos comprension digital/VR (0-5),10,3.9,4.0,0.88,3.0,5.0
-Prueba 2,Aciertos comprension fisico (0-5),10,4.0,4.0,0.94,2.0,5.0
