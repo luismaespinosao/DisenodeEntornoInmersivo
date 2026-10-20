@@ -1,0 +1,2701 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>Entorno de Estudio — P3</title>
+  <script src="vendor/aframe.min.js"></script>
+  <script src="vendor/meshopt_decoder.js"></script>
+  <script src="vendor/pdf.min.js"></script>
+  <script>
+    AFRAME.registerComponent('meshopt-setup', {
+      init: function () {
+        var scene = this.el;
+        if (!window.MeshoptDecoder) { console.warn('[meshopt] no encontrado'); return; }
+        MeshoptDecoder.ready.then(function() {
+          var sys = scene.systems['gltf-model'];
+          if (sys && sys.loader) {
+            sys.loader.setMeshoptDecoder(MeshoptDecoder);
+            console.log('[meshopt] Decoder configurado OK');
+          }
+        });
+      }
+    });
+
+    /* ══════════════════════════════════════════════════════
+       PASSTHROUGH CUTOUT COMPONENT
+       Escribe alpha=0 en el framebuffer → el compositor XR
+       muestra el mundo real (passthrough) en esa región.
+       El cielo 360° sigue visible en el resto de la pantalla.
+    ══════════════════════════════════════════════════════ */
+    AFRAME.registerComponent('passthrough-cutout', {
+      init: function () {
+        var el = this.el;
+        function applyMat() {
+          var mesh = el.getObject3D('mesh');
+          if (!mesh) return;
+          // Shader mínimo: solo escribe alpha=0 (transparente total → muestra passthrough)
+          mesh.material = new THREE.ShaderMaterial({
+            vertexShader:   'void main(){gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.);}',
+            fragmentShader: 'void main(){gl_FragColor=vec4(0.,0.,0.,0.);}',
+            transparent: true,
+            depthWrite:  false,
+            depthTest:   false,
+            side:        THREE.DoubleSide
+          });
+          // renderOrder alto = se pinta DESPUÉS del cielo 360°, sobreescribiéndolo con alpha=0
+          mesh.renderOrder = 999;
+          el.object3D.renderOrder = 999;
+          console.log('[MR] Passthrough cutout listo');
+        }
+        el.addEventListener('object3dset', applyMat);
+        if (el.getObject3D('mesh')) applyMat();
+      }
+    });
+
+    /* ══════════════════════════════════════════════════════
+       PANEL-DRAG — arrastrar para mover, esquina para escalar.
+       Funciona con mouse en escritorio Y con el rayo del
+       control en el Quest (trigger = mousedown en A-Frame).
+
+       Corrección VR: en lugar de buscar el raycaster "activo" en
+       cada tick (que antes encontraba el cursor del mouse en
+       lugar del control del visor), ahora el drag-handle pasa el
+       cursorEl exacto que disparó el evento, y panel-drag lo usa
+       directamente durante todo el arrastre.
+    ══════════════════════════════════════════════════════ */
+    AFRAME.registerComponent('panel-drag', {
+      init: function () {
+        var el = this.el;
+        var sceneEl = el.sceneEl;
+        this._state      = null;
+        this._plane      = new THREE.Plane();
+        this._offset     = new THREE.Vector3();
+        this._panelWorld = new THREE.Vector3();
+        this._startScale = 1;
+        this._startDist  = 0;
+        this._activeCursorEl = null; // el control/cursor que inició el drag
+
+        el.addEventListener('drag-start', function (evt) {
+          var type     = evt.detail.type;
+          var pt       = evt.detail.point;
+          var cursorEl = evt.detail.cursorEl;
+
+          var camera = sceneEl.camera;
+          var dir = new THREE.Vector3();
+          camera.getWorldDirection(dir);
+          el.object3D.getWorldPosition(this._panelWorld);
+          this._plane.setFromNormalAndCoplanarPoint(dir, this._panelWorld);
+          this._offset.subVectors(this._panelWorld, pt);
+          this._startScale     = el.object3D.scale.x;
+          this._startDist      = pt.distanceTo(this._panelWorld);
+          this._state          = type;
+          this._activeCursorEl = cursorEl || null;
+        }.bind(this));
+
+        var endDrag = function () {
+          this._state = null;
+          this._activeCursorEl = null;
+        }.bind(this);
+        window.addEventListener('mouseup', endDrag);
+
+        // En VR el trigger del control dispara 'triggerup' en la entidad
+        // del control, que burbujea hasta la escena.
+        sceneEl.addEventListener('triggerup', endDrag);
+
+        // También escuchar en los controles directamente para mayor fiabilidad
+        sceneEl.addEventListener('loaded', function () {
+          sceneEl.querySelectorAll('[laser-controls]').forEach(function (ctrl) {
+            ctrl.addEventListener('triggerup', endDrag);
+          });
+        });
+      },
+
+      tick: function () {
+        if (!this._state) return;
+
+        // Usar el raycaster del control que inició el drag.
+        // Si no hay (ej. desktop), caer al cursor del mouse.
+        var cursorEl = this._activeCursorEl;
+        if (!cursorEl) {
+          cursorEl = this.el.sceneEl.querySelector('[cursor]');
+        }
+        if (!cursorEl || !cursorEl.components || !cursorEl.components.raycaster) return;
+
+        var ray = cursorEl.components.raycaster.raycaster.ray;
+        var hit = new THREE.Vector3();
+        if (!ray.intersectPlane(this._plane, hit)) return;
+
+        if (this._state === 'move') {
+          var newWorld = hit.clone().add(this._offset);
+          var parent = this.el.object3D.parent;
+          if (parent) parent.worldToLocal(newWorld);
+          this.el.object3D.position.copy(newWorld);
+
+        } else if (this._state === 'resize') {
+          var d = hit.distanceTo(this._panelWorld);
+          if (this._startDist > 0.02) {
+            var s = Math.max(0.25, Math.min(2.8,
+              this._startScale * d / this._startDist));
+            this.el.object3D.scale.setScalar(s);
+          }
+        }
+      }
+    });
+
+    /* drag-handle — pone en la barra superior (move) o esquina (resize).
+       Pasa el cursorEl exacto al panel-drag para que use ese rayo en VR. */
+    AFRAME.registerComponent('drag-handle', {
+      schema: { type: { default: 'move' } },
+      init: function () {
+        var self = this;
+        this.el.addEventListener('mousedown', function (evt) {
+          if (!evt.detail || !evt.detail.intersection) return;
+          // cursorEl = el control/cursor que disparó el evento
+          var cursorEl = evt.detail.cursorEl || null;
+          self.el.emit('drag-start', {
+            type:     self.data.type,
+            point:    evt.detail.intersection.point.clone(),
+            cursorEl: cursorEl
+          });
+        });
+      }
+    });
+
+    /* camera-follow — mantiene la entidad en una posición fija relativa a la
+       cámara, actualizada cada frame, y es detectable por laser-controls
+       (cosa que no pasa cuando el objeto es hijo directo de <a-camera>).
+       No se usa actualmente (se quitó el botón de menú en VR), pero se
+       deja disponible por si se necesita un elemento anclado a la vista. */
+    AFRAME.registerComponent('camera-follow', {
+      schema: { offset: { type: 'vec3', default: {x:0.4, y:-0.3, z:-0.85} } },
+      init: function () {
+        this._tmpPos  = new THREE.Vector3();
+        this._tmpQuat = new THREE.Quaternion();
+        this._tmpOff  = new THREE.Vector3();
+      },
+      tick: function () {
+        var cam = this.el.sceneEl.camera;
+        if (!cam) return;
+        cam.getWorldPosition(this._tmpPos);
+        cam.getWorldQuaternion(this._tmpQuat);
+        this._tmpOff.copy(this.data.offset).applyQuaternion(this._tmpQuat);
+        this.el.object3D.position.copy(this._tmpPos).add(this._tmpOff);
+        this.el.object3D.quaternion.copy(this._tmpQuat);
+      }
+    });
+  </script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Outfit:wght@300;400;600;700;800&display=swap');
+
+    :root {
+      --cyan:#00e6ff; --cyan-r:0; --cyan-g:230; --cyan-b:255;
+      --text-r:255; --text-g:255; --text-b:255;
+      --glass:rgba(6,12,30,0.82);
+      --page-bg:#000; --page-bg-r:2; --page-bg-g:5; --page-bg-b:18;
+      --panel-solid:#070d1f;
+      --panel-solid-2:#0d1a2e;
+      --panel-solid-3:#0a0e1a;
+    }
+    body.theme-light {
+      --cyan:#0d7f96; --cyan-r:13; --cyan-g:127; --cyan-b:150;
+      --text-r:20; --text-g:24; --text-b:36;
+      --glass:rgba(255,255,255,0.88);
+      --page-bg:#f2f0e9; --page-bg-r:242; --page-bg-g:240; --page-bg-b:233;
+      --panel-solid:#ffffff;
+      --panel-solid-2:#eef1f5;
+      --panel-solid-3:#ffffff;
+    }
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body { font-family:'Outfit',sans-serif; overflow:hidden; background:var(--page-bg); color:rgb(var(--text-r),var(--text-g),var(--text-b)); transition:background .3s ease; }
+    #app-root { width:100%; height:100%; }
+
+    /* ══════════════════════════════════════════
+       MODO VR / INMERSIVO — vista limpia
+       Al entrar en VR (headset real o "pantalla
+       completa" sin lentes) solo deben verse:
+       escena 3D (mesa, KodKod, entorno 360°) +
+       visor de lectura PDF. El resto del HUD 2D
+       (timer, paneles, badges, hint) se oculta,
+       igual que se comportaba originalmente.
+    ══════════════════════════════════════════ */
+    body.vr-clean .vr-hide { display:none !important; }
+
+    /* ══════════════════════════════════════════
+       REGLA DE ORO: todo overlay → pointer-events:none
+       Solo botones declarados → pointer-events:auto
+    ══════════════════════════════════════════ */
+
+    /* ── LENTE VISOR (siempre encima) ── */
+    #visor {
+      position:fixed; inset:0; z-index:10; pointer-events:none;
+      background:radial-gradient(ellipse 84% 92% at 50% 52%,
+        transparent 56%, rgba(0,0,0,0.55) 76%, rgba(0,0,0,0.97) 93%);
+    }
+
+    /* ── BARRA SUPERIOR (estado del visor) ── */
+    #top-bar {
+      position:fixed; top:18px; width:100%; display:flex;
+      justify-content:center; gap:28px; z-index:30; pointer-events:none;
+      font-family:'Share Tech Mono',monospace; font-size:11px;
+      color:rgba(var(--text-r),var(--text-g),var(--text-b),0.35); letter-spacing:2px;
+    }
+
+    /* ── Botón pantalla completa — persistente, visible en cualquier pantalla ── */
+    #btn-fullscreen {
+      position:fixed; top:18px; right:18px; z-index:150;
+      width:34px; height:34px; border-radius:9px;
+      background:var(--glass); border:1px solid rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.3);
+      color:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.75); font-size:16px; cursor:pointer;
+      display:flex; align-items:center; justify-content:center;
+      pointer-events:auto; backdrop-filter:blur(10px); transition:all .2s;
+    }
+    #btn-fullscreen:hover { border-color:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.7); color:var(--cyan);
+      background:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.08); }
+
+    /* ── Botón tema claro/oscuro — junto al de pantalla completa ── */
+    #btn-theme {
+      position:fixed; top:18px; right:60px; z-index:150;
+      width:34px; height:34px; border-radius:9px;
+      background:var(--glass); border:1px solid rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.3);
+      color:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.75); font-size:15px; cursor:pointer;
+      display:flex; align-items:center; justify-content:center;
+      pointer-events:auto; backdrop-filter:blur(10px); transition:all .2s;
+    }
+    #btn-theme:hover { border-color:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.7); color:var(--cyan);
+      background:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.08); }
+
+    /* ══════════════════════════════════════════
+       TUTORIAL DE BIENVENIDA — carrusel de slides
+
+       Estructura en 3 capas (de atrás hacia adelante):
+       1) #tutorial-bg-full  → copia en grande de la interfaz REAL de
+          la que se está hablando, llenando toda la pantalla.
+       2) #tutorial-dim      → velo oscuro + blur para que el texto
+          de encima siga siendo legible.
+       3) #tutorial-card     → la tarjeta con el texto, de un solo
+          color sólido, sin nada de fondo dentro de ella.
+    ══════════════════════════════════════════ */
+    #tutorial-overlay {
+      position:fixed; inset:0; z-index:300;
+      display:none; align-items:center; justify-content:center;
+      pointer-events:auto; overflow:hidden;
+    }
+    #tutorial-overlay.on { display:flex; }
+
+    #tutorial-bg-full {
+      position:absolute; inset:0; z-index:0;
+      display:flex; align-items:center; justify-content:center;
+      overflow:hidden; pointer-events:none;
+      opacity:0.5; filter:blur(0.5px) saturate(0.9);
+    }
+    /* Contenedor que centra y escala la copia real de la interfaz */
+    .t-clone-wrap { display:flex; flex-direction:column;
+      align-items:center; gap:18px; pointer-events:none; }
+
+    #tutorial-dim {
+      position:absolute; inset:0; z-index:1;
+      background:rgba(var(--page-bg-r),var(--page-bg-g),var(--page-bg-b),0.72); backdrop-filter:blur(6px);
+      pointer-events:none;
+    }
+
+    #tutorial-card {
+      position:relative; z-index:2; width:560px; max-width:90vw;
+      background:var(--panel-solid); border:1px solid rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.22);
+      border-radius:22px; padding:42px 44px 28px;
+      box-shadow:0 0 60px rgba(0,0,0,0.5);
+    }
+    #tutorial-skip {
+      position:absolute; top:16px; right:18px; background:none; border:none;
+      color:rgba(var(--text-r),var(--text-g),var(--text-b),0.3); font-family:'Share Tech Mono',monospace;
+      font-size:10px; letter-spacing:1.5px; cursor:pointer; padding:6px 10px;
+      transition:color .2s;
+    }
+    #tutorial-skip:hover { color:rgba(var(--text-r),var(--text-g),var(--text-b),0.65); }
+    #tutorial-slides { min-height:260px; display:flex; align-items:center; }
+    .t-slide { display:none; text-align:center; width:100%; }
+    .t-slide.active { display:block; animation:tslidein .35s ease; }
+    @keyframes tslidein { from{opacity:0; transform:translateY(8px)} to{opacity:1; transform:translateY(0)} }
+    .t-icon {
+      width:78px; height:78px; margin:0 auto 18px; border-radius:50%;
+      background:radial-gradient(circle, rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.14), transparent 70%);
+      border:1px solid rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.3); display:flex; align-items:center;
+      justify-content:center; font-size:36px;
+    }
+    .t-eyebrow { font-family:'Share Tech Mono',monospace; font-size:9px;
+      letter-spacing:4px; color:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.45); text-transform:uppercase;
+      margin-bottom:10px; }
+    .t-title { font-size:21px; font-weight:800; margin-bottom:12px; letter-spacing:-0.3px; }
+    .t-desc { font-size:13px; line-height:1.65; color:rgba(var(--text-r),var(--text-g),var(--text-b),0.55);
+      max-width:420px; margin:0 auto; }
+    #tutorial-dots { display:flex; justify-content:center; gap:7px; margin:24px 0 18px; }
+    .t-dot { width:7px; height:7px; border-radius:50%;
+      background:rgba(var(--text-r),var(--text-g),var(--text-b),0.15); transition:all .25s; cursor:pointer; }
+    .t-dot.active { background:var(--cyan); box-shadow:0 0 6px var(--cyan); width:18px; border-radius:4px; }
+    #tutorial-nav { display:flex; align-items:center; justify-content:space-between; }
+    .t-nav-btn {
+      background:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.07); border:1px solid rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.28);
+      color:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.8); font-family:'Outfit',sans-serif; font-weight:600;
+      font-size:12px; padding:10px 18px; border-radius:9px; cursor:pointer;
+      transition:all .2s;
+    }
+    .t-nav-btn:hover { background:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.16); }
+    .t-nav-btn:disabled { opacity:0.25; cursor:default; }
+    .t-nav-btn.primary { background:var(--cyan); color:#000; border-color:var(--cyan); }
+    .t-nav-btn.primary:hover { box-shadow:0 0 16px rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.4); }
+    #t-counter { font-family:'Share Tech Mono',monospace; font-size:10px;
+      color:rgba(var(--text-r),var(--text-g),var(--text-b),0.3); letter-spacing:1px; }
+
+    /* Ícono grande de respaldo para pasos sin interfaz 2D que clonar
+       (bienvenida y entrada a VR) */
+    .t-bigicon { font-size:160px; opacity:0.55;
+      filter:drop-shadow(0 0 24px rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.4)); }
+
+    /* Botón "Tutorial" para reabrir el tutorial desde la pantalla de inicio.
+       NOTA: antes estaba en la misma esquina exacta que #btn-fullscreen
+       (top:18px; right:18px), así que quedaba tapado por él — por eso
+       parecía no existir. Ahora va en la esquina opuesta. */
+    #btn-help {
+      position:absolute; top:18px; left:18px; z-index:110;
+      height:32px; padding:0 14px; border-radius:16px;
+      background:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.06); border:1px solid rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.35);
+      color:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.85); font-size:11px; font-weight:700;
+      font-family:'Outfit',sans-serif; letter-spacing:0.5px; cursor:pointer;
+      display:flex; align-items:center; gap:6px;
+      transition:all .2s; pointer-events:auto;
+    }
+    #btn-help:hover { border-color:var(--cyan); color:var(--cyan); background:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.14); }
+
+    /* ── Botón "Entrar en VR/RA" — reemplaza el botón nativo de A-Frame.
+       Detecta automáticamente si el dispositivo soporta RA (necesaria
+       para que el HUD/PDF se vean dentro del visor) y entra en ese modo;
+       si no, usa VR normal. Así no hay que adivinar qué botón usar.
+       Es la acción principal de la pantalla de inicio, así que va grande
+       y con etiqueta — una prueba de usabilidad mostró que el ícono solo
+       pasaba desapercibido. ── */
+    #btn-enter-xr-wrap {
+      position:fixed; bottom:26px; right:26px; z-index:150;
+      display:flex; flex-direction:column; align-items:center; gap:8px;
+      pointer-events:none;
+    }
+    #btn-enter-xr {
+      width:84px; height:84px; border-radius:50%;
+      background:var(--glass); border:2px solid rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.5);
+      color:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.9); font-size:38px; cursor:pointer;
+      display:flex; align-items:center; justify-content:center;
+      pointer-events:auto; backdrop-filter:blur(10px); transition:all .2s;
+      box-shadow:0 4px 22px rgba(0,0,0,0.5), 0 0 0 0 rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.35);
+      animation:vrPulse 2.6s ease-in-out infinite;
+    }
+    @keyframes vrPulse {
+      0%,100% { box-shadow:0 4px 22px rgba(0,0,0,0.5), 0 0 0 0 rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.35); }
+      50%     { box-shadow:0 4px 22px rgba(0,0,0,0.5), 0 0 0 10px rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0); }
+    }
+    #btn-enter-xr:hover { border-color:var(--cyan); background:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.16);
+      transform:scale(1.06); }
+
+    /* ══════════════════════════════════════════
+       PANTALLA DE INICIO
+    ══════════════════════════════════════════ */
+    #screen-inicio {
+      position:fixed; inset:0; z-index:100;
+      background:rgba(var(--page-bg-r),var(--page-bg-g),var(--page-bg-b),0.97);
+      display:flex; flex-direction:column; align-items:center;
+      justify-content:center; gap:28px;
+      backdrop-filter:blur(20px);
+    }
+
+    .s-eyebrow {
+      font-family:'Share Tech Mono',monospace; font-size:9px;
+      letter-spacing:5px; color:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.4); text-transform:uppercase;
+    }
+    .s-title { font-size:36px; font-weight:800; letter-spacing:-0.5px; }
+    .s-title em { color:var(--cyan); font-style:normal; }
+
+    /* Grid principal inicio */
+    .inicio-grid {
+      display:grid; grid-template-columns:1fr 1fr; gap:24px; width:780px;
+    }
+
+    .i-left { display:flex; flex-direction:column; gap:16px; }
+    .i-right { display:flex; flex-direction:column; gap:16px; }
+
+    .glass-box {
+      background:rgba(var(--text-r),var(--text-g),var(--text-b),0.03);
+      border:1px solid rgba(var(--text-r),var(--text-g),var(--text-b),0.09);
+      border-radius:18px; padding:20px;
+    }
+    .task-card {
+      background:linear-gradient(135deg,rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.08),transparent);
+      border-left:3px solid var(--cyan);
+      border-radius:0 16px 16px 0; padding:18px 20px;
+    }
+    .task-label { font-size:9px; letter-spacing:3px; color:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.5); text-transform:uppercase; margin-bottom:6px; }
+    .task-name { font-size:16px; font-weight:600; }
+
+    /* Stats row */
+    .stats-row { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+    .stat-b { background:rgba(var(--text-r),var(--text-g),var(--text-b),0.03); border:1px solid rgba(var(--text-r),var(--text-g),var(--text-b),0.08);
+      border-radius:14px; padding:16px; }
+    .stat-v { font-family:'Share Tech Mono',monospace; font-size:26px; color:var(--cyan); }
+    .stat-l { font-size:9px; letter-spacing:2px; text-transform:uppercase; color:rgba(var(--text-r),var(--text-g),var(--text-b),0.35); margin-top:2px; }
+
+    /* Mini chart */
+    .mini-chart { height:70px; display:flex; align-items:flex-end; gap:8px; margin-top:12px; }
+    .bar-c { flex:1; border-radius:4px 4px 0 0; background:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.6); }
+
+    /* ── Selección de ambiente ── */
+    .env-section-label {
+      font-family:'Share Tech Mono',monospace; font-size:8px;
+      letter-spacing:4px; color:rgba(var(--text-r),var(--text-g),var(--text-b),0.25); text-transform:uppercase;
+      display:flex; align-items:center; gap:12px;
+    }
+    .env-section-label::before,.env-section-label::after {
+      content:''; flex:1; height:1px; background:rgba(var(--text-r),var(--text-g),var(--text-b),0.06);
+    }
+
+    .env-grid { display:flex; gap:12px; }
+    .env-card {
+      flex:1; border-radius:14px; border:2px solid rgba(var(--text-r),var(--text-g),var(--text-b),0.07);
+      overflow:hidden; cursor:pointer; transition:all .22s;
+      pointer-events:auto;
+    }
+    .env-card:hover { border-color:rgba(var(--text-r),var(--text-g),var(--text-b),0.2); transform:translateY(-2px); }
+    .env-card.sel { border-color:var(--cyan); box-shadow:0 0 20px rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.15); }
+    .ec-prev { height:72px; position:relative; overflow:hidden; }
+    .ec-prev.espacio {
+      background:radial-gradient(ellipse at 50% 70%,#1a1060 0%,#050318 100%);
+    }
+    .ec-prev.bosque {
+      background:linear-gradient(to bottom,#4a7a30 0%,#2a5020 60%,#3d2b1a 100%);
+    }
+    .ec-prev.biblioteca {
+      background:linear-gradient(to bottom,#2a1a06 0%,#4a2e12 60%,#2a1408 100%);
+    }
+    /* Estrellas en la card espacio */
+    .star-dot { position:absolute; border-radius:50%; background:rgb(var(--text-r),var(--text-g),var(--text-b)); }
+    /* Libros en card biblioteca */
+    .book-strip { position:absolute; bottom:0; left:0; right:0; height:40px;
+      display:flex; align-items:flex-end; gap:2px; padding:0 8px; }
+    .bk { border-radius:2px 2px 0 0; }
+
+    .ec-check { position:absolute; top:8px; right:8px; width:18px; height:18px;
+      border-radius:50%; background:var(--cyan); display:none;
+      align-items:center; justify-content:center; font-size:10px; color:#000; font-weight:900; }
+    .env-card.sel .ec-check { display:flex; }
+    .ec-info { padding:10px 12px 12px; background:rgba(0,0,0,0.5); }
+    .ec-name { font-size:12px; font-weight:700; color:rgb(var(--text-r),var(--text-g),var(--text-b)); margin-bottom:2px; }
+    .ec-desc { font-size:9px; color:rgba(var(--text-r),var(--text-g),var(--text-b),0.35); line-height:1.5; }
+
+    /* Config chips */
+    .cfg-box {
+      background:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.02); border:1px solid rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.1);
+      border-radius:14px; padding:14px 18px;
+      display:flex; flex-direction:column; gap:10px;
+    }
+    .cfg-row { display:flex; align-items:center; justify-content:space-between; }
+    .cfg-lbl { font-size:11px; color:rgba(var(--text-r),var(--text-g),var(--text-b),0.35); display:flex; align-items:center; gap:7px; }
+    .rft { font-family:'Share Tech Mono',monospace; font-size:8px;
+      color:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.4); background:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.07);
+      border:1px solid rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.18); padding:1px 5px; border-radius:3px; }
+    .chips { display:flex; gap:5px; }
+    .chip { padding:5px 11px; border-radius:16px; font-size:10px; font-weight:600;
+      border:1px solid rgba(var(--text-r),var(--text-g),var(--text-b),0.1); color:rgba(var(--text-r),var(--text-g),var(--text-b),0.3);
+      cursor:pointer; background:transparent; transition:all .16s; pointer-events:auto; }
+    .chip:hover { border-color:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.4); color:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.7); }
+    .chip.on { background:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.12); border-color:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.6); color:var(--cyan); }
+    .cfg-div { height:1px; background:rgba(var(--text-r),var(--text-g),var(--text-b),0.05); }
+
+    /* Start button */
+    #btn-start {
+      background:var(--cyan); color:#000; border:none;
+      padding:16px 0; border-radius:12px; font-weight:800; font-size:14px;
+      cursor:pointer; text-transform:uppercase; letter-spacing:3px;
+      box-shadow:0 8px 28px rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.3);
+      pointer-events:auto; transition:all .2s; width:100%;
+    }
+    #btn-start:hover { transform:translateY(-1px); box-shadow:0 12px 36px rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.4); }
+
+    /* ══════════════════════════════════════════
+       HUD DE SESIÓN — todo pointer-events:none
+    ══════════════════════════════════════════ */
+    #hud { position:fixed; inset:0; z-index:50; display:none; pointer-events:none; }
+
+    /* RF badge */
+    .rf { font-family:'Share Tech Mono',monospace; font-size:8px; letter-spacing:1.5px;
+      background:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.1); border:1px solid rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.28);
+      color:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.65); padding:2px 6px; border-radius:3px;
+      display:inline-block; margin-bottom:3px; }
+
+    /* Timer (arriba centro) */
+    #hud-timer {
+      position:absolute; top:26px; left:50%; transform:translateX(-50%);
+      background:var(--glass); border:1px solid rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.4);
+      border-radius:50px; padding:10px 30px;
+      display:flex; align-items:center; gap:20px;
+      backdrop-filter:blur(12px);
+      box-shadow:0 0 24px rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.1);
+    }
+    .t-label { font-family:'Share Tech Mono',monospace; font-size:8px;
+      letter-spacing:3px; color:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.5); text-transform:uppercase; }
+    #t-digits { font-family:'Share Tech Mono',monospace; font-size:34px;
+      color:rgb(var(--text-r),var(--text-g),var(--text-b)); letter-spacing:5px; text-shadow:0 0 14px rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.4); }
+    #t-digits.urgent { color:#ff7070; text-shadow:0 0 14px rgba(255,80,80,0.5);
+      animation:blink .8s ease-in-out infinite; }
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.65} }
+    .pdots { display:flex; gap:5px; }
+    .pd { width:7px; height:7px; border-radius:50%;
+      border:1px solid rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.35); background:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.1); transition:all .4s; }
+    .pd.done { background:var(--cyan); box-shadow:0 0 5px var(--cyan); }
+
+    /* Panel izquierdo — Progreso + Métricas */
+    #panel-left {
+      position:absolute; top:50%; left:28px; transform:translateY(-50%);
+      background:var(--glass); border:1px solid rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.2);
+      border-radius:22px; padding:22px 18px; width:220px;
+      backdrop-filter:blur(12px); display:flex; flex-direction:column; gap:20px;
+    }
+    .p-section-title { font-size:9px; letter-spacing:2.5px; text-transform:uppercase;
+      color:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.45); border-bottom:1px solid rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.08);
+      padding-bottom:8px; margin-bottom:4px; }
+    .bar-bg { background:rgba(var(--text-r),var(--text-g),var(--text-b),0.05); border-radius:3px; height:4px; margin-bottom:6px; }
+    .bar-fill { height:100%; border-radius:3px;
+      background:linear-gradient(90deg,#0077ff,#00e6ff);
+      box-shadow:0 0 7px rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.5); transition:width 1.2s ease; width:0%; }
+    .stat-row { display:flex; justify-content:space-between; font-size:10px; color:rgba(var(--text-r),var(--text-g),var(--text-b),0.3); }
+    .stat-row strong { color:var(--cyan); }
+    .metric-row { display:flex; justify-content:space-between; align-items:center; }
+    .metric-lbl { font-size:10px; color:rgba(var(--text-r),var(--text-g),var(--text-b),0.35); }
+    .metric-val { font-family:'Share Tech Mono',monospace; font-size:12px; color:rgb(var(--text-r),var(--text-g),var(--text-b)); }
+    .metric-val.green { color:#44ff88; }
+    .metric-val.cyan { color:var(--cyan); }
+
+    /* Panel derecho — Asistente + Control Sensorial */
+    #panel-right {
+      position:absolute; top:50%; right:28px; transform:translateY(-50%);
+      background:var(--glass); border:1px solid rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.2);
+      border-radius:22px; padding:22px 18px; width:220px;
+      backdrop-filter:blur(12px); display:flex; flex-direction:column; gap:18px;
+      pointer-events:auto; /* sliders e interacciones */
+    }
+
+    /* Asistente */
+    .asistente-msg {
+      font-size:12px; line-height:1.65; color:rgba(var(--text-r),var(--text-g),var(--text-b),0.65);
+      font-style:italic;
+    }
+    .asistente-by { font-size:9px; color:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.4); letter-spacing:1px; margin-top:6px; }
+
+    /* Sensorial toggles */
+    .sp-row { display:flex; flex-direction:column; gap:4px; }
+    .sp-lbl { display:flex; justify-content:space-between; font-size:10px; color:rgba(var(--text-r),var(--text-g),var(--text-b),0.4); }
+    .sp-lbl strong { color:var(--cyan); font-size:10px; }
+    input[type=range].sp-slider { -webkit-appearance:none; width:100%; height:2px;
+      background:rgba(var(--text-r),var(--text-g),var(--text-b),0.08); border-radius:2px; outline:none; cursor:pointer; }
+    input[type=range].sp-slider::-webkit-slider-thumb { -webkit-appearance:none;
+      width:12px; height:12px; border-radius:50%; background:var(--cyan);
+      box-shadow:0 0 6px rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.7); }
+    .tog-row { display:flex; justify-content:space-between; align-items:center;
+      font-size:10px; color:rgba(var(--text-r),var(--text-g),var(--text-b),0.4); }
+    .tog { width:30px; height:16px; border-radius:8px; cursor:pointer; position:relative;
+      border:1px solid rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.35); background:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.08); transition:all .2s; }
+    .tog.on { background:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.4); border-color:var(--cyan); }
+    .tog::after { content:''; position:absolute; top:2px; left:2px; width:10px; height:10px;
+      border-radius:50%; background:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.5); transition:left .2s, background .2s; }
+    .tog.on::after { left:16px; background:var(--cyan); }
+
+    /* Env badge arriba-derecha */
+    #env-badge {
+      position:absolute; top:26px; right:28px;
+      background:var(--glass); border:1px solid rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.18);
+      border-radius:8px; padding:7px 13px;
+      display:flex; align-items:center; gap:8px;
+      backdrop-filter:blur(10px); font-size:10px; color:rgba(var(--text-r),var(--text-g),var(--text-b),0.5);
+    }
+    .env-dot { width:7px; height:7px; border-radius:50%; }
+    .env-dot.espacio   { background:#8855ff; box-shadow:0 0 6px #8855ff; }
+    .env-dot.bosque    { background:#44cc66; box-shadow:0 0 6px #44cc66; }
+    .env-dot.biblioteca{ background:#ffaa33; box-shadow:0 0 6px #ffaa33; }
+
+    /* Zona enfoque */
+    #focus-zone {
+      position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
+      width:58%; height:54%;
+      border:1px solid rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.18); border-radius:10px;
+      box-shadow:0 0 0 2000px rgba(0,2,12,0.5);
+    }
+    #fz-label { position:absolute; bottom:-20px; left:50%; transform:translateX(-50%);
+      font-family:'Share Tech Mono',monospace; font-size:8px; letter-spacing:2px;
+      color:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.3); white-space:nowrap; }
+
+    /* Status bar abajo-izquierda */
+    #status-bar {
+      position:absolute; bottom:26px; left:28px;
+      display:flex; gap:8px; align-items:center;
+    }
+    .pill { background:var(--glass); border:1px solid rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.14);
+      border-radius:7px; padding:6px 12px; font-size:10px; color:rgba(var(--text-r),var(--text-g),var(--text-b),0.35);
+      display:flex; align-items:center; gap:6px; backdrop-filter:blur(8px); }
+    .sdot { width:6px; height:6px; border-radius:50%; }
+    .sdot.g { background:#00ff88; box-shadow:0 0 5px #00ff88; }
+    .sdot.y { background:#ffcc00; }
+
+    /* Hint abajo-centro */
+    #hint { position:absolute; bottom:26px; left:50%; transform:translateX(-50%);
+      font-size:9px; color:rgba(var(--text-r),var(--text-g),var(--text-b),0.15); letter-spacing:1px; white-space:nowrap; }
+
+    /* ══ PANTALLA DE PAUSA ══ */
+    #screen-pause {
+      position:fixed; inset:0; z-index:80; pointer-events:none;
+      background:rgba(var(--page-bg-r),var(--page-bg-g),var(--page-bg-b),0.92); display:none;
+      flex-direction:column; align-items:center; justify-content:center; gap:16px;
+      backdrop-filter:blur(16px);
+    }
+    #screen-pause.on { display:flex; }
+    .p-emoji { font-size:52px; animation:breathe 3s ease-in-out infinite; }
+    @keyframes breathe { 0%,100%{transform:scale(1)} 50%{transform:scale(1.07)} }
+    .p-title { font-size:22px; font-weight:800; color:rgba(255,200,70,0.95); letter-spacing:1px; }
+    .p-sub { font-size:10px; color:rgba(var(--text-r),var(--text-g),var(--text-b),0.25); letter-spacing:3px; text-transform:uppercase; }
+    .p-time { font-family:'Share Tech Mono',monospace; font-size:58px; color:rgb(var(--text-r),var(--text-g),var(--text-b)); letter-spacing:7px; }
+    #btn-resume { pointer-events:auto; background:rgba(255,200,70,0.1);
+      border:1px solid rgba(255,200,70,0.45); color:rgba(255,200,70,0.9);
+      font-family:'Outfit',sans-serif; font-size:11px; font-weight:700;
+      letter-spacing:4px; text-transform:uppercase; padding:12px 36px;
+      border-radius:9px; cursor:pointer; transition:all .2s; }
+    #btn-resume:hover { background:rgba(255,200,70,0.2); }
+
+    /* Fade overlay */
+    #fade { position:fixed; inset:0; z-index:200; background:var(--page-bg);
+      opacity:0; pointer-events:none; transition:opacity .5s; }
+    #fade.in { opacity:1; pointer-events:all; }
+
+    /* ══════════════════════════════════════════
+       VISOR DE LECTURA PDF — RF7
+    ══════════════════════════════════════════ */
+    #pdf-viewer {
+      position:fixed; top:50%; left:50%; transform:translate(-50%,-50%);
+      width:480px; max-height:82vh; z-index:65;
+      background:var(--glass); border:1px solid rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.3);
+      border-radius:18px; backdrop-filter:blur(16px);
+      box-shadow:0 0 40px rgba(0,0,0,0.6), 0 0 24px rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.1);
+      display:none; flex-direction:column; pointer-events:auto;
+      overflow:hidden;
+      resize:both; min-width:320px; min-height:280px; max-width:90vw;
+    }
+    #pdf-viewer.on { display:flex; }
+    #pdf-header {
+      display:flex; align-items:center; justify-content:space-between;
+      padding:12px 16px; border-bottom:1px solid rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.15);
+      flex-shrink:0; gap:10px; flex-wrap:wrap;
+    }
+    #pdf-title { font-size:11px; font-weight:700; color:rgba(var(--text-r),var(--text-g),var(--text-b),0.8);
+      letter-spacing:0.5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    #pdf-controls { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+    .pdf-grp { display:flex; align-items:center; gap:4px; padding-right:6px;
+      border-right:1px solid rgba(var(--text-r),var(--text-g),var(--text-b),0.08); }
+    .pdf-grp:last-child { border-right:none; padding-right:0; }
+    .pdf-btn {
+      background:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.08); border:1px solid rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.3);
+      color:var(--cyan); width:26px; height:26px; border-radius:7px;
+      font-size:14px; font-weight:700; cursor:pointer; display:flex;
+      align-items:center; justify-content:center; transition:all .15s; flex-shrink:0;
+      font-family:'Outfit',sans-serif;
+    }
+    .pdf-btn:hover { background:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.2); }
+    .pdf-btn:disabled { opacity:0.3; cursor:default; }
+    #pdf-zoom-level, #pdf-page-info {
+      font-family:'Share Tech Mono',monospace; font-size:10px;
+      color:rgba(var(--text-r),var(--text-g),var(--text-b),0.45); min-width:34px; text-align:center;
+    }
+    #pdf-close { background:rgba(255,90,90,0.1); border-color:rgba(255,90,90,0.35); color:#ff8080; }
+    #pdf-close:hover { background:rgba(255,90,90,0.22); }
+    #pdf-config {
+      background:rgba(var(--text-r),var(--text-g),var(--text-b),0.06); border-color:rgba(var(--text-r),var(--text-g),var(--text-b),0.2);
+      color:rgba(var(--text-r),var(--text-g),var(--text-b),0.7); font-size:11px; width:auto; padding:0 9px;
+      gap:5px; white-space:nowrap;
+    }
+    #pdf-config:hover { background:rgba(var(--text-r),var(--text-g),var(--text-b),0.14); color:rgb(var(--text-r),var(--text-g),var(--text-b)); }
+    #pdf-body {
+      flex:1; overflow:auto; display:flex; justify-content:center;
+      padding:18px; background:rgba(0,0,0,0.25);
+    }
+    #pdf-body::-webkit-scrollbar { width:8px; }
+    #pdf-body::-webkit-scrollbar-thumb { background:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.25); border-radius:4px; }
+    #pdf-canvas { box-shadow:0 4px 24px rgba(0,0,0,0.5); border-radius:2px; }
+    #pdf-loading, #pdf-error {
+      color:rgba(var(--text-r),var(--text-g),var(--text-b),0.4); font-size:12px; text-align:center;
+      padding:40px 20px; align-self:center;
+    }
+    #pdf-error { color:rgba(255,140,140,0.8); }
+
+    /* ── Botón regresar al inicio ── */
+    #btn-back {
+      position:absolute; top:26px; left:28px;
+      background:var(--glass); border:1px solid rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.35);
+      color:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.75); font-family:'Outfit',sans-serif;
+      font-size:10px; font-weight:700; letter-spacing:2.5px;
+      text-transform:uppercase; padding:10px 16px; border-radius:9px;
+      cursor:pointer; backdrop-filter:blur(12px); pointer-events:auto;
+      transition:all .2s; display:flex; align-items:center; gap:7px;
+    }
+    #btn-back:hover { border-color:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.7); color:var(--cyan);
+      background:rgba(var(--cyan-r),var(--cyan-g),var(--cyan-b),0.08); }
+  </style>
+</head>
+<body>
+
+<!-- ════════════════════════════════════════
+     CONTENEDOR RAÍZ — escena + todos los overlays.
+     Necesario para que el HUD y el visor de PDF
+     permanezcan visibles en modo VR / pantalla completa
+     (la API Fullscreen solo muestra el subárbol del
+     elemento puesto en fullscreen).
+════════════════════════════════════════ -->
+<div id="app-root">
+
+<!-- ════════════════════════════════════════
+     A-FRAME — Navegación nativa intacta
+     (ningún overlay HTML puede bloquear esto)
+════════════════════════════════════════ -->
+<a-scene
+  id="scene"
+  meshopt-setup
+  renderer="antialias:true; colorManagement:true; alpha:true"
+  webxr="requiredFeatures:local-floor; optionalFeatures:dom-overlay,hand-tracking; overlayElement:#app-root"
+  xr-mode-ui="enabled:false">
+
+  <a-assets timeout="15000">
+    <!-- Panorámicas 360° -->
+    <img id="sky-bosque"     src="fondo-bosque.jpg"     crossorigin="anonymous">
+    <img id="sky-espacio"    src="fondo-espacio.jpg"    crossorigin="anonymous">
+    <img id="sky-biblioteca" src="fondo-biblioteca.jpg" crossorigin="anonymous">
+    <!-- Modelo 3D asistente -->
+    <a-asset-item id="asistente-glb" src="asistente.glb"></a-asset-item>
+  </a-assets>
+
+  <!-- ══ ILUMINACIÓN (se actualiza por ambiente) ══ -->
+  <a-light id="l-amb" type="ambient"     color="#1a2a1a" intensity="0.7"></a-light>
+  <a-light id="l-dir" type="directional" color="#a0c8ff" intensity="0.5" position="2 4 1"></a-light>
+  <a-light id="l-lmp" type="point"       color="#ffcc88" intensity="1.0" distance="4" position="1.2 1.6 -1.5"></a-light>
+
+  <!-- ══ SKY — cambia por ambiente usando #id precargado ══ -->
+  <a-sky id="sky-el" src="#sky-bosque" rotation="0 -90 0"></a-sky>
+
+  <!-- ══ SUELO COMPARTIDO ══ -->
+  <a-plane
+    id="suelo-shared"
+    position="0 0 0" rotation="-90 0 0"
+    width="2" height="2"
+    color="#2d4a1e" roughness="0.95" metalness="0.02">
+  </a-plane>
+
+  <!-- ══ ENTORNO ESPACIO — la imagen HDRI fondo-espacio.jpg hace todo el trabajo visual ══ -->
+  <a-entity id="env-espacio" visible="false"></a-entity>
+
+  <!-- ══ ENTORNO BIBLIOTECA — la imagen HDRI fondo-biblioteca.jpg hace todo el trabajo visual ══ -->
+  <a-entity id="env-biblioteca" visible="false"></a-entity>
+
+  <!-- ══ ESCRITORIO (compartido — tu código mejorado) ══ -->
+  <a-entity position="0 -0.18 -1.5">
+
+    <!-- Superficie del escritorio -->
+    <a-box id="desk-surface" position="0 0.7 0" width="2.2" height="0.06" depth="0.9" color="#4b3621"></a-box>
+
+    <!-- ══ VENTANA MR — solo visible en Quest 3 modo passthrough ══
+         Plano con shader alpha=0 que "recorta" el cielo 360° y deja
+         ver el escritorio real del usuario debajo del entorno virtual.
+         Está 1 mm sobre la superficie del escritorio.                ══ -->
+    <a-plane
+      id="mr-cutout"
+      passthrough-cutout
+      position="0 0.735 0"
+      rotation="-90 0 0"
+      width="2.25" height="0.95"
+      visible="false">
+    </a-plane>
+
+    <!-- Laptop -->
+    <a-entity position="0 0.73 0">
+      <a-box width="0.5" height="0.02" depth="0.35" color="#1a1a1a"></a-box>
+      <a-box position="0 0.18 -0.17" rotation="-25 0 0" width="0.5" height="0.35" depth="0.02" color="#222">
+        <a-plane
+          id="laptop-screen"
+          class="clickable"
+          position="0 0 0.011" width="0.47" height="0.32"
+          color="#0a1a3a" emissive="#00aaff" emissive-intensity="0.25"
+          animation__hin="property:emissiveIntensity; to:0.55; dur:140; startEvents:mouseenter"
+          animation__hout="property:emissiveIntensity; to:0.25; dur:200; startEvents:mouseleave"
+          animation__cin="property:scale; to:1.04 1.04 1.04; dur:90; startEvents:mouseenter"
+          animation__cout="property:scale; to:1 1 1; dur:140; startEvents:mouseleave">
+        </a-plane>
+      </a-box>
+    </a-entity>
+
+    <!-- Teclado -->
+    <a-box position="0 0.72 0.2" width="0.45" height="0.01" depth="0.18" color="#1c1c22"></a-box>
+
+    <!-- ══ LECTOR DE PDF EN 3D — RF7 ══
+         Aparece al hacer clic en la pantalla de la laptop. No depende
+         de dom-overlay: es geometría real de la escena, así que se ve
+         igual en escritorio, VR y RA dentro del visor. Reutiliza el
+         mismo canvas (#pdf-canvas) que ya renderiza PDF.js. ══ -->
+    <!-- ══ LECTOR 3D — RF7 — rediseño estilo "Read Mode" de Adobe ══
+         Documento maximizado, chrome minimizado. Una sola franja de
+         agarre arriba (sin título), botón cerrar en la esquina, y una
+         única barra flotante inferior agrupada (navegación · scroll ·
+         zoom) que se superpone levemente al documento, igual que el
+         modo de lectura de Acrobat. Todo el color pasa por clases
+         th-* que ThemeSys actualiza al alternar claro/oscuro. -->
+    <a-entity id="reader3d" panel-drag visible="false" position="0 1.30 0.50">
+
+      <!-- Fondo del panel -->
+      <a-plane class="th-bg" position="0 0 -0.008" width="0.80" height="1.28"
+        color="#0a0e1a" opacity="0.97" material="shader:flat"></a-plane>
+      <a-plane class="th-glow" position="0 0 -0.010" width="0.82" height="1.30"
+        color="#00e6ff" opacity="0.15" material="shader:flat"></a-plane>
+
+      <!-- FRANJA DE AGARRE (arriba, drag para mover) — minimal, sin texto -->
+      <a-plane drag-handle="type: move" class="clickable th-bg2"
+        position="0 0.605 0.002" width="0.80" height="0.055"
+        color="#0d1a2e" opacity="0.9" material="shader:flat"
+        animation__hin="property:scale; to:1 1.15 1; dur:100; startEvents:mouseenter"
+        animation__hout="property:scale; to:1 1 1; dur:160; startEvents:mouseleave">
+      </a-plane>
+      <a-circle class="th-glow" position="-0.02 0.605 0.006" radius="0.006" opacity="0.6" color="#00e6ff" material="shader:flat"></a-circle>
+      <a-circle class="th-glow" position="0 0.605 0.006"     radius="0.006" opacity="0.6" color="#00e6ff" material="shader:flat"></a-circle>
+      <a-circle class="th-glow" position="0.02 0.605 0.006"  radius="0.006" opacity="0.6" color="#00e6ff" material="shader:flat"></a-circle>
+
+      <!-- Cerrar — esquina superior derecha, fuera de la franja de agarre -->
+      <a-circle id="btn3d-close" class="clickable th-danger" position="0.35 0.605 0.006" radius="0.026"
+        material="shader:flat"
+        animation__hin="property:scale; to:1.18 1.18 1.18; dur:80; startEvents:mouseenter"
+        animation__hout="property:scale; to:1 1 1; dur:120; startEvents:mouseleave"></a-circle>
+      <a-text class="th-danger-text" value="X" align="center" baseline="center" position="0.35 0.605 0.009" width="0.32"></a-text>
+
+      <!-- ÁREA DE DOCUMENTO — casi todo el panel, como Read Mode -->
+      <a-plane id="pdf-plane-3d" position="0 -0.02 0.002" width="0.74" height="1.16"
+        material="shader:flat; src:#pdf-canvas; transparent:true"></a-plane>
+      <a-text id="reader3d-loading" class="th-text" value="Cargando documento..." align="center" baseline="center"
+        position="0 -0.02 0.006" width="1.0"></a-text>
+
+      <!-- BARRA FLOTANTE INFERIOR — un solo grupo, se superpone al documento -->
+      <a-plane class="th-glow" position="0 -0.565 0.0105" width="0.72" height="0.092"
+        opacity="0.12" material="shader:flat"></a-plane>
+      <a-plane id="reader3d-toolbar-bg" class="th-bg2" position="0 -0.565 0.011" width="0.70" height="0.088"
+        opacity="0.94" material="shader:flat"></a-plane>
+
+      <a-entity position="0 -0.565 0.014">
+
+        <!-- Grupo: navegación de página -->
+        <a-plane id="btn3d-prev" class="clickable th-chip" position="-0.27 0 0" width="0.10" height="0.066"
+          material="shader:flat"
+          animation__hin="property:scale; to:1.15 1.15 1.15; dur:80; startEvents:mouseenter"
+          animation__hout="property:scale; to:1 1 1; dur:120; startEvents:mouseleave"></a-plane>
+        <a-text class="th-text-dim" value="&lt;" align="center" baseline="center" position="-0.27 0 0.004" width="0.4"></a-text>
+
+        <a-text id="reader3d-status" class="th-text-dim" value="1 / 1 · 100%" align="center" baseline="center"
+          position="-0.155 0 0.004" width="0.4"></a-text>
+
+        <a-plane id="btn3d-next" class="clickable th-chip" position="-0.045 0 0" width="0.10" height="0.066"
+          material="shader:flat"
+          animation__hin="property:scale; to:1.15 1.15 1.15; dur:80; startEvents:mouseenter"
+          animation__hout="property:scale; to:1 1 1; dur:120; startEvents:mouseleave"></a-plane>
+        <a-text class="th-text-dim" value="&gt;" align="center" baseline="center" position="-0.045 0 0.004" width="0.4"></a-text>
+
+        <a-plane class="th-glow" position="0.015 0 0.002" width="0.004" height="0.045" opacity="0.4" material="shader:flat"></a-plane>
+
+        <!-- Grupo: desplazamiento vertical dentro de la página -->
+        <a-plane id="btn3d-scroll-up" class="clickable th-chip" position="0.065 0 0" width="0.065" height="0.066"
+          material="shader:flat"
+          animation__hin="property:scale; to:1.15 1.15 1.15; dur:80; startEvents:mouseenter"
+          animation__hout="property:scale; to:1 1 1; dur:120; startEvents:mouseleave"></a-plane>
+        <a-text class="th-text-dim" value="^" align="center" baseline="center" position="0.065 0 0.004" width="0.45"></a-text>
+
+        <a-plane id="btn3d-scroll-dn" class="clickable th-chip" position="0.13 0 0" width="0.065" height="0.066"
+          material="shader:flat"
+          animation__hin="property:scale; to:1.15 1.15 1.15; dur:80; startEvents:mouseenter"
+          animation__hout="property:scale; to:1 1 1; dur:120; startEvents:mouseleave"></a-plane>
+        <a-text class="th-text-dim" value="v" align="center" baseline="center" position="0.13 0 0.004" width="0.45"></a-text>
+
+        <a-plane class="th-glow" position="0.175 0 0.002" width="0.004" height="0.045" opacity="0.4" material="shader:flat"></a-plane>
+
+        <!-- Grupo: zoom -->
+        <a-plane id="btn3d-zoom-out" class="clickable th-chip" position="0.215 0 0" width="0.05" height="0.06"
+          material="shader:flat"
+          animation__hin="property:scale; to:1.18 1.18 1.18; dur:80; startEvents:mouseenter"
+          animation__hout="property:scale; to:1 1 1; dur:120; startEvents:mouseleave"></a-plane>
+        <a-text class="th-text-dim" value="-" align="center" baseline="center" position="0.215 0 0.004" width="0.4"></a-text>
+
+        <a-plane id="btn3d-zoom-in" class="clickable th-chip" position="0.275 0 0" width="0.05" height="0.06"
+          material="shader:flat"
+          animation__hin="property:scale; to:1.18 1.18 1.18; dur:80; startEvents:mouseenter"
+          animation__hout="property:scale; to:1 1 1; dur:120; startEvents:mouseleave"></a-plane>
+        <a-text class="th-text-dim" value="+" align="center" baseline="center" position="0.275 0 0.004" width="0.4"></a-text>
+
+      </a-entity>
+
+      <!-- Redimensionar — esquina inferior derecha del panel -->
+      <a-plane drag-handle="type: resize" class="clickable"
+        position="0.36 -0.615 0.004" width="0.05" height="0.05"
+        color="#44ff88" opacity="0.35" material="shader:flat"
+        animation__hin="property:material.opacity; to:0.80; dur:100; startEvents:mouseenter"
+        animation__hout="property:material.opacity; to:0.35; dur:180; startEvents:mouseleave"></a-plane>
+      <a-text value="/ /" align="center" baseline="center" position="0.36 -0.615 0.007" width="0.6" color="#44ff88"></a-text>
+
+    </a-entity><!-- fin reader3d -->
+
+    <!-- ══ BOTÓN 3D "SALIR" — ícono circular pequeño con una casita
+         dibujada con geometría real (no emoji): la fuente que usa
+         A-Frame para texto 3D (a-text) NO soporta emojis, por eso antes
+         "🏠" se veía como espacio vacío. Esto sí se renderiza siempre. ══ -->
+    <a-entity id="btn3d-exit" class="clickable" position="-0.95 1.0 0.3"
+      geometry="primitive: circle; radius: 0.12" material="opacity:0; transparent:true; depthWrite:false"
+      animation__hin="property:scale; to:1.12 1.12 1.12; dur:90; startEvents:mouseenter"
+      animation__hout="property:scale; to:1 1 1; dur:140; startEvents:mouseleave">
+      <a-circle class="th-glow" position="0 0 -0.003" radius="0.075"
+        opacity="0.22" material="shader:flat">
+      </a-circle>
+      <a-circle class="th-bg2" radius="0.065"
+        material="shader:flat">
+      </a-circle>
+      <!-- Casita: cuerpo (cuadrado) + techo (triángulo), color acento -->
+      <a-plane class="th-text-dim" position="0 -0.012 0.006" width="0.034" height="0.026"
+        material="shader:flat">
+      </a-plane>
+      <a-triangle class="th-text-dim"
+        vertex-a="0 0.026 0.006" vertex-b="-0.026 -0.004 0.006" vertex-c="0.026 -0.004 0.006"
+        material="shader:flat">
+      </a-triangle>
+      <a-plane class="th-bg2" position="0 -0.016 0.007" width="0.008" height="0.014"
+        material="shader:flat">
+      </a-plane>
+    </a-entity>
+
+
+    <!-- Libros apilados -->
+        <!--
+<a-entity position="-0.8 0.73 0">
+      <a-box position="0 0.03 0" width="0.18" height="0.06" depth="0.25" color="#8b2222"></a-box>
+      <a-box position="0 0.09 0" width="0.17" height="0.06" depth="0.23" color="#1a5a2a"></a-box>
+      <a-box position="0 0.15 0" width="0.18" height="0.06" depth="0.25" color="#4a3a8a"></a-box>
+    </a-entity>
+-->
+    <!-- Lentes — toca para salir de VR. La zona clicable (radio 0.14) es
+         la entidad completa (más grande que el ícono visual) para que sea
+         fácil apuntarle con el rayo del control. Antes era una taza; se
+         cambió por unos lentes porque comunica mejor la acción real:
+         "quítate el visor". -->
+    <a-entity id="glasses-hitzone" class="clickable" position="0.75 0.73 0.1"
+      geometry="primitive: cylinder; radius: 0.14; height: 0.22"
+      material="opacity:0; transparent:true; depthWrite:false"
+      animation__hin="property:scale; to:1.12 1.12 1.12; dur:120; startEvents:mouseenter"
+      animation__hout="property:scale; to:1 1 1; dur:180; startEvents:mouseleave">
+
+      <!-- Visual: un par de lentes apoyados sobre el escritorio -->
+      <a-torus class="th-text-dim" position="-0.032 0.043 0" radius="0.026" radius-tubular="0.005"
+        rotation="-90 0 0" material="shader:flat"></a-torus>
+      <a-torus class="th-text-dim" position="0.032 0.043 0" radius="0.026" radius-tubular="0.005"
+        rotation="-90 0 0" material="shader:flat"></a-torus>
+      <a-box class="th-text-dim" position="0 0.043 0" width="0.016" height="0.005" depth="0.005"
+        material="shader:flat"></a-box>
+      <a-box class="th-text-dim" position="-0.072 0.043 -0.01" width="0.036" height="0.004" depth="0.004"
+        rotation="0 25 0" material="shader:flat"></a-box>
+      <a-box class="th-text-dim" position="0.072 0.043 -0.01" width="0.036" height="0.004" depth="0.004"
+        rotation="0 -25 0" material="shader:flat"></a-box>
+    </a-entity>
+
+    <!-- ── ASISTENTE VIRTUAL 3D ── -->
+    <a-entity id="asistente-root" position="-0.75 0.73 0.1" rotation="0 30 0">
+
+      <!-- ══ BASE / PEDESTAL ══ -->
+      <a-cylinder
+        position="0 0.015 0"
+        radius="0.09" height="0.03"
+        color="#060e22" metalness="0.85" roughness="0.2">
+      </a-cylinder>
+
+      <!-- Anillo exterior giratorio -->
+      <a-torus
+        position="0 0.015 0"
+        radius="0.092" radius-tubular="0.005"
+        color="#00aaff" opacity="0.7" rotation="-90 0 0"
+        animation="property:rotation; from:-90 0 0; to:-90 360 0; dur:4500; loop:true; easing:linear">
+      </a-torus>
+
+      <!-- Anillo interior giratorio inverso -->
+      <a-torus
+        position="0 0.015 0"
+        radius="0.072" radius-tubular="0.003"
+        color="#00e6ff" opacity="0.4" rotation="-90 0 0"
+        animation="property:rotation; from:-90 0 0; to:-90 -360 0; dur:7000; loop:true; easing:linear">
+      </a-torus>
+
+      <!-- Glow base pulsante -->
+      <a-circle
+        position="0 0.016 0" rotation="-90 0 0"
+        radius="0.085" color="#00aaff" opacity="0.12"
+        animation="property:opacity; from:0.06; to:0.28; dur:1800; loop:true; dir:alternate; easing:easeInOutSine">
+      </a-circle>
+
+      <!-- ══ MODELO 3D — GLB: coloca tu archivo como "asistente.glb" en la misma carpeta ══ -->
+      <a-gltf-model
+        id="modelo-glb"
+        src="#asistente-glb"
+        position="0 0.03 0"
+        scale="0.40 0.40 0.40"
+        animation="property:position; from:0 0.03 0; to:0 0.06 0; dur:2200; loop:true; dir:alternate; easing:easeInOutSine"
+        animation__rot="property:rotation; from:0 0 0; to:0 360 0; dur:18000; loop:true; easing:linear"
+        animation__stretch="property:scale; from:0.40 0.40 0.40; to:0.46 0.34 0.46; dur:650; dir:alternate; loop:4; easing:easeInOutSine; startEvents:kodkod-stretch">
+      </a-gltf-model>
+
+      <!-- ══ MODELO OBJ — (Opción B: coloca asistente.obj + asistente.mtl) ══ -->
+      <!-- Descomenta este bloque y comenta el anterior si usas OBJ -->
+      <!--
+      <a-obj-model
+        id="modelo-obj"
+        src="#asistente-obj"
+        mtl="#asistente-mtl"
+        position="0 0.03 0"
+        scale="0.40 0.40 0.40"
+        animation="property:position; from:0 0.03 0; to:0 0.06 0; dur:2200; loop:true; dir:alternate; easing:easeInOutSine"
+        animation__rot="property:rotation; from:0 0 0; to:0 360 0; dur:18000; loop:true; easing:linear">
+      </a-obj-model>
+      -->
+
+      <!-- ══ PLACEHOLDER HOLOGRÁFICO ══
+           Se muestra siempre debajo — si tu modelo carga correctamente lo ocultará visualmente.
+           Úsalo como referencia de posición o déjalo como efecto de aura.
+      ══ -->
+      <a-entity id="holo-placeholder" position="0 0.03 0">
+
+        <!-- Cuerpo principal — cápsula holográfica -->
+        <a-cylinder
+          radius="0.055" height="0.28"
+          color="#00ccff" opacity="0.08" wireframe="true">
+        </a-cylinder>
+
+        <!-- Cabeza esfera -->
+        <a-sphere
+          position="0 0.20 0"
+          radius="0.055"
+          color="#00e6ff" opacity="0.12" wireframe="true"
+          animation="property:scale; from:1 1 1; to:1.05 1.05 1.05; dur:1600; loop:true; dir:alternate; easing:easeInOutSine">
+        </a-sphere>
+
+        <!-- Líneas de energía flotantes -->
+        <a-torus
+          position="0 0.08 0"
+          radius="0.06" radius-tubular="0.002"
+          color="#00e6ff" opacity="0.35" rotation="90 0 0"
+          animation="property:rotation; from:90 0 0; to:90 0 360; dur:3000; loop:true; easing:linear">
+        </a-torus>
+        <a-torus
+          position="0 0.16 0"
+          radius="0.05" radius-tubular="0.002"
+          color="#88aaff" opacity="0.25" rotation="70 20 0"
+          animation="property:rotation; from:70 20 0; to:70 20 360; dur:4000; loop:true; easing:linear">
+        </a-torus>
+
+      </a-entity>
+
+
+      <!-- ══ ÁREA CLICABLE — abarca el modelo completo de KodKod ══ -->
+      <a-cylinder
+        id="kodkod-hitbox" class="clickable"
+        position="0 0.2 0" radius="0.13" height="0.42"
+        material="shader:flat; opacity:0"
+        animation__hin="property:material.opacity; to:0.06; dur:120; startEvents:mouseenter"
+        animation__hout="property:material.opacity; to:0; dur:200; startEvents:mouseleave">
+      </a-cylinder>
+
+      <!-- ══ PANEL DE MÉTRICAS — aparece al hacer clic en KodKod ══ -->
+      <a-entity id="kodkod-metrics" visible="false" position="0 0.62 0">
+        <a-plane class="th-bg" position="0 0 -0.005" width="0.36" height="0.22"
+          opacity="0.94" material="shader:flat">
+        </a-plane>
+        <a-plane class="th-glow" position="0 0 -0.004" width="0.38" height="0.24"
+          opacity="0.18" material="shader:flat">
+        </a-plane>
+        <a-text class="th-text-dim" value="Estado de tu sesión" align="center" baseline="center"
+          position="0 0.085 0" width="0.85"></a-text>
+        <a-text id="km-time" class="th-text" value="Tiempo activo: 00:00" align="center" baseline="center"
+          position="0 0.03 0" width="0.78"></a-text>
+        <a-text id="km-phase" class="th-text" value="Fase: Enfoque" align="center" baseline="center"
+          position="0 -0.015 0" width="0.78"></a-text>
+        <a-text id="km-pomos" class="th-text" value="Pomodoros: 0/4" align="center" baseline="center"
+          position="0 -0.06 0" width="0.78"></a-text>
+        <a-text id="km-bpm" class="th-text-dim" value="Ritmo cardíaco: 72 BPM" align="center" baseline="center"
+          position="0 -0.105 0" width="0.78"></a-text>
+      </a-entity>
+
+      <!-- ══ PANEL "KODKOD SUGIERE" — RF4: ejercicios durante la pausa ══
+           Solo visible durante el descanso. Las indicaciones rotan cada
+           ~20s (ver enterPause() / cycleExercise() en el script). ══ -->
+      <a-entity id="kodkod-exercise" visible="false" position="0 0.68 0">
+        <a-plane class="th-bg" position="0 0 -0.006" width="0.46" height="0.27"
+          opacity="0.95" material="shader:flat">
+        </a-plane>
+        <a-plane position="0 0 -0.005" width="0.48" height="0.29"
+          color="#ffcc46" opacity="0.22" material="shader:flat">
+        </a-plane>
+        <a-text value="KodKod sugiere" align="center" baseline="center"
+          position="0 0.10 0" width="0.95" color="#ffcc46"></a-text>
+        <a-text id="ke-title" class="th-text" value="Estira el cuello" align="center" baseline="center"
+          position="0 0.045 0" width="1.05"></a-text>
+        <a-text id="ke-desc" class="th-text-dim" value="" align="center" baseline="center"
+          position="0 -0.01 0" width="0.82" wrap-count="34">
+        </a-text>
+        <a-text id="ke-counter" value="1 / 6" align="center" baseline="center"
+          position="0 -0.105 0" width="0.7" color="rgba(255,204,70,0.7)"></a-text>
+      </a-entity>
+
+    </a-entity>
+
+  </a-entity><!-- fin escritorio -->
+
+  <!-- ══ CÁMARA ══ -->
+  <a-camera id="cam" position="0 1.6 0"
+    look-controls="magicWindowTrackingEnabled:false; reverseMouseDrag:false"
+    wasd-controls="acceleration:15">
+
+    <!-- ══ PAUSA 3D — hijo directo de la cámara, siempre frente al usuario.
+         Funciona en cualquier modo VR/AR sin necesitar dom-overlay.
+         Se muestra en paralelo a la pantalla 2D de pausa (escritorio).  ══ -->
+    <a-entity id="pause3d" visible="false" position="0 0.02 -1.3">
+
+      <!-- Fondo del panel -->
+      <a-plane width="1.45" height="1.05"
+        color="#ffcc46" opacity="0.18" material="shader:flat" position="0 0 -0.003">
+      </a-plane>
+      <a-plane class="th-bg" width="1.42" height="1.02"
+        opacity="0.97" material="shader:flat">
+      </a-plane>
+
+      <!-- Ícono y título -->
+      <a-text id="p3d-emoji" class="th-text" value=":)"  align="center" baseline="center" position="0  0.40 0.005" width="2.8"></a-text>
+      <a-text value="PAUSA ACTIVA"          align="center" baseline="center" position="0  0.28 0.005" width="2.8" color="#ffcc46" font="exo2bold"></a-text>
+
+      <!-- Ejercicio actual -->
+      <a-text id="p3d-ex-title" class="th-text" value=""    align="center" baseline="center" position="0  0.16 0.005" width="2.6"></a-text>
+      <a-text id="p3d-ex-desc"  class="th-text-dim" value="" align="center" baseline="center" position="0  0.04 0.005" width="2.1" wrap-count="42"></a-text>
+
+      <!-- Timer grande -->
+      <a-text id="p3d-timer" class="th-text" value="02:00" align="center" baseline="center" position="0 -0.19 0.005" width="5.0" font="exo2bold"></a-text>
+
+      <!-- Contador de ejercicio y hint -->
+      <a-text id="p3d-ex-counter" value="Ejercicio 1 / 6" align="center" baseline="center" position="0 -0.35 0.005" width="2.0" color="rgba(255,204,70,0.65)"></a-text>
+      <a-text value="Toca Continuar para volver" align="center" baseline="center" position="0 -0.44 0.005" width="1.8" color="rgba(255,255,255,0.3)"></a-text>
+
+    </a-entity>
+
+  </a-camera>
+
+  <!-- ══ PUNTEROS DE INTERACCIÓN — funcionan en escritorio (mouse) y
+       dentro del visor (controles), independientes del HUD 2D/dom-overlay.
+       Cualquier entidad con class="clickable" responde a estos. ══ -->
+  <a-entity cursor="rayOrigin: mouse" raycaster="objects: .clickable; far: 8"></a-entity>
+  <a-entity id="ctrl-left"  laser-controls="hand: left"  raycaster="objects: .clickable; far: 8"></a-entity>
+  <a-entity id="ctrl-right" laser-controls="hand: right" raycaster="objects: .clickable; far: 8"></a-entity>
+
+</a-scene>
+
+<!-- ════ OVERLAYS — pointer-events:none salvo excepciones ════ -->
+<div id="visor"></div>
+
+<!-- Botón de pantalla completa — siempre visible, en cualquier pantalla -->
+<button id="btn-fullscreen" onclick="toggleFullscreen()" title="Pantalla completa">⛶</button>
+<button id="btn-theme" onclick="toggleTheme()" title="Cambiar tema claro/oscuro">◐</button>
+
+<!-- Botón "Entrar en VR/RA" — detecta automáticamente el modo correcto -->
+<div id="btn-enter-xr-wrap" class="vr-hide">
+  <button id="btn-enter-xr" onclick="enterImmersive()" title="Entrar en VR / Realidad Mixta">🥽</button>
+</div>
+
+<div id="top-bar" class="vr-hide">
+  <span>PWR: 88%</span>
+  <span id="tb-env">ENV: BOSQUE</span>
+  <span id="tb-time">--:--</span>
+</div>
+
+<!-- HUD sesión -->
+<div id="hud">
+
+  <!-- Botón regresar al inicio -->
+  <button id="btn-back" onclick="goBack()">
+    <svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <path d="M7.5 2L3.5 6L7.5 10" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+    Inicio
+  </button>
+
+  <!-- Timer centro-arriba -->
+  <div id="hud-timer" class="vr-hide">
+    <div style="display:flex;flex-direction:column;align-items:center;gap:2px">
+      <span class="rf">RF2 · RF5</span>
+      <div class="t-label" id="t-phase">ENFOQUE</div>
+    </div>
+    <div id="t-digits">07:00</div>
+    <div style="display:flex;flex-direction:column;align-items:center;gap:5px">
+      <div class="pdots">
+        <div class="pd" id="d0"></div><div class="pd" id="d1"></div>
+        <div class="pd" id="d2"></div><div class="pd" id="d3"></div>
+      </div>
+      <div class="t-label">POMODOROS</div>
+    </div>
+  </div>
+
+  <!-- Panel izquierdo — Progreso + Métricas -->
+  <div id="panel-left" class="vr-hide">
+    <div>
+      <span class="rf">RNF1</span>
+      <div class="p-section-title">Progreso de Sesión</div>
+      <div class="bar-bg"><div class="bar-fill" id="prog-bar"></div></div>
+      <div class="stat-row">Completado <strong><span id="pct">0</span>%</strong></div>
+      <div class="stat-row" style="margin-top:3px">Pomodoros <strong><span id="cnt">0</span>/4</strong></div>
+    </div>
+    <div>
+      <div class="p-section-title">Métricas · <span style="font-size:8px;color:rgba(0,230,255,0.4)">RNF1</span></div>
+      <div class="metric-row" style="margin-bottom:8px">
+        <div class="metric-lbl">Estado</div>
+        <div class="metric-val green">Concentración Alta</div>
+      </div>
+      <div class="metric-row" style="margin-bottom:8px">
+        <div class="metric-lbl">Ritmo Cardíaco</div>
+        <div class="metric-val cyan" id="bpm">72 BPM</div>
+      </div>
+      <div class="metric-row">
+        <div class="metric-lbl">Tiempo activo</div>
+        <div class="metric-val" id="elapsed">00:00</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Zona de enfoque RF3 -->
+  <div id="focus-zone" class="vr-hide">
+    <div id="fz-label">ZONA DE ENFOQUE · RF3</div>
+  </div>
+
+  <!-- Panel derecho — Asistente + Controles -->
+  <div id="panel-right" class="vr-hide">
+
+    <!-- Asistente IA -->
+    <div>
+      <span class="rf">RF2</span>
+      <div class="p-section-title">Asistente</div>
+      <div class="asistente-msg" id="asistente-msg">
+        "Bienvenido. Tu sesión de estudio ha comenzado. Mantén el enfoque."
+      </div>
+      <div class="asistente-by">— Entorno de Estudio P3</div>
+    </div>
+
+    <!-- Control sensorial RF6 -->
+    <div>
+      <span class="rf">RF6 · RNF3</span>
+      <div class="p-section-title">Control Sensorial</div>
+      <div class="sp-row">
+        <div class="sp-lbl">Iluminación <strong id="vl">60%</strong></div>
+        <input type="range" class="sp-slider" value="60" oninput="document.getElementById('vl').textContent=this.value+'%'; setIluminacion(this.value)">
+      </div>
+      <div class="sp-row" style="margin-top:8px">
+        <div class="sp-lbl">Volumen <strong id="vv">40%</strong></div>
+        <input type="range" class="sp-slider" value="40" oninput="document.getElementById('vv').textContent=this.value+'%'; AudioSys.setVolume(this.value)">
+      </div>
+      <div class="sp-row" style="margin-top:8px">
+        <div class="sp-lbl">Overlay <strong id="vo">70%</strong></div>
+        <input type="range" class="sp-slider" value="70" oninput="document.getElementById('vo').textContent=this.value+'%'; setOverlay(this.value)">
+      </div>
+    </div>
+
+    <!-- Toggles RF1 RF4 -->
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <div class="tog-row">
+        Bloqueo digital <span class="rf" style="font-size:7px">RF1</span>
+        <div class="tog on" onclick="this.classList.toggle('on')"></div>
+      </div>
+      <div class="tog-row">
+        Zona enfoque <span class="rf" style="font-size:7px">RF3</span>
+        <div class="tog on" onclick="this.classList.toggle('on');document.getElementById('focus-zone').style.display=this.classList.contains('on')?'block':'none'"></div>
+      </div>
+      <div class="tog-row">
+        Pausas activas <span class="rf" style="font-size:7px">RF4</span>
+        <div class="tog on" id="tog-pausas" onclick="this.classList.toggle('on');S.pausas=this.classList.contains('on')"></div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Env badge arriba-derecha -->
+  <div id="env-badge" class="vr-hide">
+    <div class="env-dot bosque" id="edot"></div>
+    <span id="env-label">🌲 Bosque</span>
+  </div>
+
+  <!-- Status bar abajo-izquierda -->
+  <div id="status-bar" class="vr-hide">
+    <div class="pill"><div class="sdot g"></div>Concentración activa</div>
+    <div class="pill"><div class="sdot y"></div><span id="el-time">00:00</span></div>
+    <div class="pill"><span class="rf" style="margin:0">RNF2</span>Meta Quest 3</div>
+    <div class="pill" id="mr-pill" style="display:none;border-color:rgba(0,255,136,0.4)">
+      <div class="sdot" style="background:#00ff88;box-shadow:0 0 5px #00ff88"></div>
+      <span style="color:#00ff88">MR Activo</span>
+    </div>
+  </div>
+
+  <div id="hint" class="vr-hide">Arrastrar ratón para mirar · WASD para mover</div>
+
+  <!-- ══ VISOR DE LECTURA PDF — RF7 ══ -->
+  <div id="pdf-viewer">
+    <div id="pdf-header">
+      <span id="pdf-title">📖 Lectura asignada</span>
+      <div id="pdf-controls">
+        <div class="pdf-grp">
+          <button class="pdf-btn" id="pdf-zoom-out" onclick="pdfZoom(-0.05)" title="Reducir texto">−</button>
+          <span id="pdf-zoom-level">120%</span>
+          <button class="pdf-btn" id="pdf-zoom-in" onclick="pdfZoom(0.05)" title="Aumentar texto">+</button>
+        </div>
+        <div class="pdf-grp">
+          <button class="pdf-btn" id="pdf-prev" onclick="pdfPrevPage()" title="Página anterior">‹</button>
+          <span id="pdf-page-info">1 / 1</span>
+          <button class="pdf-btn" id="pdf-next" onclick="pdfNextPage()" title="Página siguiente">›</button>
+        </div>
+        <div class="pdf-grp">
+          <button class="pdf-btn" id="pdf-panel-smaller" onclick="pdfResizePanel(-1)" title="Achicar visor">⤡</button>
+          <button class="pdf-btn" id="pdf-panel-bigger" onclick="pdfResizePanel(1)" title="Agrandar visor">⤢</button>
+        </div>
+        <div class="pdf-grp">
+          <button class="pdf-btn" id="pdf-config" onclick="togglePdfViewer(false)" title="Cerrar y volver a Iluminación/Volumen">⚙ Configuración</button>
+          <button class="pdf-btn" id="pdf-close" onclick="togglePdfViewer(false)" title="Cerrar">✕</button>
+        </div>
+      </div>
+    </div>
+    <div id="pdf-body">
+      <div id="pdf-loading">Cargando documento…</div>
+      <canvas id="pdf-canvas" style="display:none"></canvas>
+    </div>
+  </div>
+
+</div><!-- fin #hud -->
+
+<!-- PAUSA -->
+<div id="screen-pause">
+  <div class="p-emoji" id="p-emoji">☕</div>
+  <span class="rf">RF4 · Reducción de fatiga</span>
+  <div class="p-title">Pausa Activa</div>
+  <div class="p-sub" id="p-exercise-title">Retira el visor · Estira</div>
+  <div class="p-sub" id="p-exercise-desc" style="max-width:340px; line-height:1.5; margin-top:4px; font-size:11px; opacity:0.7; text-transform:none; letter-spacing:0.3px;"></div>
+  <div class="p-time" id="p-time">02:00</div>
+  <button id="btn-resume" onclick="resume()">↩ Continuar sesión</button>
+</div>
+
+<!-- INICIO -->
+<div id="screen-inicio">
+  <button id="btn-help" onclick="openTutorial()" title="Ver tutorial">❓ Tutorial</button>
+  <div class="s-eyebrow">UTM · Maestría Medios Interactivos · Propuesta P3</div>
+  <div class="s-title">Entorno de <em>Estudio</em></div>
+
+  <div class="inicio-grid">
+    <!-- Izquierda: TODO lo que se elige — ambiente + configuración -->
+    <div class="i-left">
+      <!-- Selección de ambiente -->
+      <div class="env-section-label">ambiente de estudio</div>
+      <div class="env-grid">
+        <div class="env-card" data-env="espacio" onclick="pickEnv(this)">
+          <div class="ec-check">✓</div>
+          <div class="ec-prev espacio">
+            <div class="star-dot" style="width:2px;height:2px;top:20%;left:25%;opacity:.9"></div>
+            <div class="star-dot" style="width:3px;height:3px;top:40%;left:65%;opacity:.7"></div>
+            <div class="star-dot" style="width:2px;height:2px;top:60%;left:45%;opacity:.8"></div>
+            <div class="star-dot" style="width:2px;height:2px;top:15%;left:80%;opacity:.65"></div>
+            <div class="star-dot" style="width:2px;height:2px;top:70%;left:20%;opacity:.75"></div>
+          </div>
+          <div class="ec-info"><div class="ec-name">🌌 Espacio</div><div class="ec-desc">Cosmos oscuro, máxima concentración.</div></div>
+        </div>
+        <div class="env-card sel" data-env="bosque" onclick="pickEnv(this)">
+          <div class="ec-check">✓</div>
+          <div class="ec-prev bosque">
+            <svg width="100%" height="72" xmlns="http://www.w3.org/2000/svg">
+              <ellipse cx="30%"  cy="60%" rx="15%" ry="28%" fill="#2e4818"/>
+              <ellipse cx="55%"  cy="55%" rx="18%" ry="32%" fill="#3a5828"/>
+              <ellipse cx="80%"  cy="62%" rx="14%" ry="25%" fill="#2e4818"/>
+            </svg>
+          </div>
+          <div class="ec-info"><div class="ec-name">🌲 Bosque</div><div class="ec-desc">Panorámica 360° real. Naturaleza.</div></div>
+        </div>
+        <div class="env-card" data-env="biblioteca" onclick="pickEnv(this)">
+          <div class="ec-check">✓</div>
+          <div class="ec-prev biblioteca">
+            <div class="book-strip">
+              <div class="bk" style="width:7px;height:26px;background:#8b2222"></div>
+              <div class="bk" style="width:6px;height:20px;background:#224488"></div>
+              <div class="bk" style="width:8px;height:28px;background:#226644"></div>
+              <div class="bk" style="width:6px;height:22px;background:#885522"></div>
+              <div class="bk" style="width:7px;height:25px;background:#664488"></div>
+              <div class="bk" style="width:6px;height:20px;background:#aa3322"></div>
+              <div class="bk" style="width:8px;height:27px;background:#2244aa"></div>
+              <div class="bk" style="width:6px;height:23px;background:#228844"></div>
+            </div>
+          </div>
+          <div class="ec-info"><div class="ec-name">📚 Biblioteca</div><div class="ec-desc">Cálido, estanterías y lámparas Edison.</div></div>
+        </div>
+      </div>
+
+      <!-- Config chips -->
+      <div class="cfg-box">
+        <div class="cfg-row">
+          <div class="cfg-lbl">Método <span class="rft">RF5</span></div>
+          <div class="chips" id="c-met">
+            <button class="chip on" onclick="chip(this,'c-met')">Pomodoro</button>
+            <button class="chip"    onclick="chip(this,'c-met')">Libre</button>
+            <button class="chip"    onclick="chip(this,'c-met')">90 min</button>
+          </div>
+        </div>
+        <div class="cfg-div"></div>
+        <div class="cfg-row">
+          <div class="cfg-lbl">Sonido <span class="rft">RF6</span></div>
+          <div class="chips" id="c-snd">
+            <button class="chip on" onclick="chip(this,'c-snd')">Silencio</button>
+            <button class="chip"    onclick="chip(this,'c-snd')">Lo-fi</button>
+            <button class="chip"    onclick="chip(this,'c-snd')">Naturaleza</button>
+          </div>
+        </div>
+        <div class="cfg-div"></div>
+        <div class="cfg-row">
+          <div class="cfg-lbl">Bloqueo <span class="rft">RF1</span></div>
+          <div class="chips" id="c-blk">
+            <button class="chip on" onclick="chip(this,'c-blk')">Activado</button>
+            <button class="chip"    onclick="chip(this,'c-blk')">Desactivado</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Derecha: tarea + estadísticas + iniciar -->
+    <div class="i-right">
+      <div class="task-card">
+        <div class="task-label">Tarea seleccionada</div>
+        <div class="task-name">Escritura de Tesis: Capítulo 3</div>
+      </div>
+
+      <div class="stats-row">
+        <div class="stat-b">
+          <div class="stat-v">04</div>
+          <div class="stat-l">Sesiones hoy</div>
+        </div>
+        <div class="stat-b">
+          <div class="stat-v">120m</div>
+          <div class="stat-l">Enfoque total</div>
+        </div>
+      </div>
+      <div class="glass-box">
+        <div style="font-size:9px;letter-spacing:2px;color:rgba(255,255,255,0.3);text-transform:uppercase;margin-bottom:8px">Progreso semanal</div>
+        <div class="mini-chart">
+          <div class="bar-c" style="height:40%"></div>
+          <div class="bar-c" style="height:70%"></div>
+          <div class="bar-c" style="height:90%"></div>
+          <div class="bar-c" style="height:60%"></div>
+          <div class="bar-c" style="height:80%"></div>
+        </div>
+      </div>
+
+      <button id="btn-start" onclick="startSession()">▶ &nbsp; Iniciar Sesión</button>
+    </div>
+  </div><!-- fin inicio-grid -->
+</div>
+
+<!-- ══ TUTORIAL DE BIENVENIDA — RNF4 ══ -->
+<div id="tutorial-overlay">
+  <div id="tutorial-bg-full"></div>
+  <div id="tutorial-dim"></div>
+  <div id="tutorial-card">
+    <button id="tutorial-skip" onclick="closeTutorial()">SALTAR ✕</button>
+
+    <div id="tutorial-slides">
+
+      <div class="t-slide active" data-i="0">
+        <div class="t-icon">🐆</div>
+        <div class="t-eyebrow">Paso 1 de 6</div>
+        <div class="t-title">¡Qué bueno que llegaste!</div>
+        <div class="t-desc">Soy <strong>KodKod</strong> y voy a acompañarte en cada sesión. Te enseño rapidito cómo funciona esto.</div>
+      </div>
+
+      <div class="t-slide" data-i="1">
+        <div class="t-icon">🌲</div>
+        <div class="t-eyebrow">Paso 2 de 6</div>
+        <div class="t-title">Elige el lugar que más te inspire</div>
+        <div class="t-desc"><strong>Bosque</strong>, <strong>Espacio</strong> o <strong>Biblioteca</strong> — el que se sienta bien para ti. Ajusta lo demás a tu gusto y dale a Iniciar Sesión.</div>
+      </div>
+
+      <div class="t-slide" data-i="2">
+        <div class="t-icon">⏱️</div>
+        <div class="t-eyebrow">Paso 3 de 6</div>
+        <div class="t-title">Así avanzamos juntos</div>
+        <div class="t-desc">Trabajamos por bloques con un temporizador <strong>Pomodoro</strong>, y yo te voy dando ánimos en cada uno.</div>
+      </div>
+
+      <div class="t-slide" data-i="3">
+        <div class="t-icon">🎚️</div>
+        <div class="t-eyebrow">Paso 4 de 6</div>
+        <div class="t-title">Este espacio también es tuyo</div>
+        <div class="t-desc">Ajusta la luz y el sonido cuando quieras. En cada pausa, aprovecha para estirarte — te lo mereces.</div>
+      </div>
+
+      <div class="t-slide" data-i="4">
+        <div class="t-icon">🥽</div>
+        <div class="t-eyebrow">Paso 5 de 6</div>
+        <div class="t-title">Cuando quieras, nos metemos de lleno</div>
+        <div class="t-desc">El botón grande te lleva a tu escritorio en VR, sin distracciones. Los lentes o la casita te traen de vuelta.</div>
+      </div>
+
+      <div class="t-slide" data-i="5">
+        <div class="t-icon">📖</div>
+        <div class="t-eyebrow">Paso 6 de 6</div>
+        <div class="t-title">Tu lectura, lista para ti</div>
+        <div class="t-desc">Toca la laptop del escritorio para abrirla. Acércala, aléjala y avanza a tu ritmo, sin prisa.</div>
+      </div>
+
+    </div>
+
+    <div id="tutorial-dots"></div>
+
+    <div id="tutorial-nav">
+      <button class="t-nav-btn" id="t-prev" onclick="tutorialNav(-1)">‹ Anterior</button>
+      <span id="t-counter">1 / 6</span>
+      <button class="t-nav-btn primary" id="t-next" onclick="tutorialNav(1)">Siguiente ›</button>
+    </div>
+  </div>
+</div>
+
+<div id="fade"></div>
+
+</div><!-- fin #app-root -->
+
+<!-- ════════════════════════════════════════
+     JAVASCRIPT
+════════════════════════════════════════ -->
+<script>
+// ── Configuración de duración de ciclos (prueba de usabilidad) ──
+const FOCUS_DURATION  = 7 * 60;   // 7 minutos de trabajo/lectura
+const BREAK_DURATION  = 2 * 60;   // 2 minutos de descanso
+const URGENT_THRESHOLD = 60;       // últimos 60s del foco parpadean en rojo
+
+function fmtTime(totalSecs) {
+  const m = Math.floor(totalSecs/60).toString().padStart(2,'0');
+  const s = (totalSecs%60).toString().padStart(2,'0');
+  return m+':'+s;
+}
+
+// ══════════════════════════════════════════════════════
+// SISTEMA DE TEMA CLARO/OSCURO
+// El CSS 2D ya reacciona solo a la clase body.theme-light
+// (variables --cyan-r/g/b, --text-r/g/b, --glass, --page-bg,
+// definidas en :root). Pero A-Frame NO lee variables CSS —
+// los materiales 3D (paneles del lector, KodKod, pausa) se
+// actualizan aquí a mano vía clases th-* sobre cada entidad.
+// ══════════════════════════════════════════════════════
+const THEME_KEY = 'eedu_theme';
+const ThemeSys = {
+  mode: 'dark',
+  palette: {
+    dark:  { bg:'#0a0e1a', bg2:'#0d1a2e', glow:'#00e6ff', chip:'#0d2440',
+             danger:'#2a0808', text:'#eaf6ff', textDim:'#6fd8ff', dangerText:'#ff8080' },
+    light: { bg:'#ffffff', bg2:'#eef1f5', glow:'#0d7f96', chip:'#dbe6ee',
+             danger:'#fbe1de', text:'#141824', textDim:'#0d7f96', dangerText:'#a33322' }
+  },
+  init() {
+    let saved = null;
+    try { saved = localStorage.getItem(THEME_KEY); } catch (e) {}
+    this.set(saved === 'light' ? 'light' : 'dark', false);
+  },
+  toggle() { this.set(this.mode === 'dark' ? 'light' : 'dark'); },
+  set(mode, persist = true) {
+    this.mode = mode;
+    document.body.classList.toggle('theme-light', mode === 'light');
+    const btn = document.getElementById('btn-theme');
+    if (btn) btn.textContent = mode === 'light' ? '◑' : '◐';
+    if (persist) { try { localStorage.setItem(THEME_KEY, mode); } catch (e) {} }
+    this._apply3D();
+  },
+  _apply3D() {
+    const p = this.palette[this.mode];
+    const set = (sel, val) => document.querySelectorAll(sel).forEach(el => el.setAttribute('color', val));
+    set('.th-bg',          p.bg);
+    set('.th-bg2',         p.bg2);
+    set('.th-glow',        p.glow);
+    set('.th-chip',        p.chip);
+    set('.th-danger',      p.danger);
+    set('.th-text',        p.text);
+    set('.th-text-dim',    p.textDim);
+    set('.th-danger-text', p.dangerText);
+  }
+};
+function toggleTheme() { ThemeSys.toggle(); }
+
+// ── Tutorial de bienvenida — RNF4 ──
+const TUTORIAL_SEEN_KEY = 'eedu_tutorial_seen';
+const TutorialSys = { idx: 0, total: 0 };
+
+function buildTutorialDots() {
+  const slides = document.querySelectorAll('.t-slide');
+  TutorialSys.total = slides.length;
+  const dotsEl = document.getElementById('tutorial-dots');
+  dotsEl.innerHTML = '';
+  slides.forEach((_, i) => {
+    const d = document.createElement('div');
+    d.className = 't-dot' + (i === 0 ? ' active' : '');
+    d.onclick = () => showTutorialSlide(i);
+    dotsEl.appendChild(d);
+  });
+}
+
+function showTutorialSlide(i) {
+  const slides = document.querySelectorAll('.t-slide');
+  const dots = document.querySelectorAll('.t-dot');
+  TutorialSys.idx = Math.max(0, Math.min(slides.length - 1, i));
+  slides.forEach((s, n) => s.classList.toggle('active', n === TutorialSys.idx));
+  dots.forEach((d, n) => d.classList.toggle('active', n === TutorialSys.idx));
+  document.getElementById('t-counter').textContent = (TutorialSys.idx + 1) + ' / ' + slides.length;
+  document.getElementById('t-prev').disabled = TutorialSys.idx === 0;
+  const nextBtn = document.getElementById('t-next');
+  const isLast = TutorialSys.idx === slides.length - 1;
+  nextBtn.textContent = isLast ? '¡Entendido! ✓' : 'Siguiente ›';
+  setTutorialFullBg(TutorialSys.idx);
+}
+
+function tutorialNav(delta) {
+  const isLast = TutorialSys.idx === TutorialSys.total - 1;
+  if (delta > 0 && isLast) { closeTutorial(); return; }
+  showTutorialSlide(TutorialSys.idx + delta);
+}
+
+// ── Fondo de pantalla completa del tutorial ──
+// Por cada paso, se llena TODO el fondo (donde antes salía negro) con
+// una copia ampliada de la interfaz REAL de la que se está hablando —
+// la grilla de ambientes, el timer, el panel de control sensorial, etc.
+// La tarjeta del texto queda siempre de un solo color sólido encima.
+function setTutorialFullBg(idx) {
+  const target = document.getElementById('tutorial-bg-full');
+  if (!target) return;
+  target.innerHTML = ''; // limpia el fondo anterior
+
+  function cloneReal(selectors, scale) {
+    const wrap = document.createElement('div');
+    wrap.className = 't-clone-wrap';
+    wrap.style.transform = 'scale(' + scale + ')';
+    selectors.forEach(sel => {
+      const src = document.querySelector(sel);
+      if (!src) return;
+      const clone = src.cloneNode(true);
+      // Solo es una vista previa — nunca debe poder dispararse ninguna
+      // acción real desde aquí, ni siquiera por accidente.
+      clone.removeAttribute('onclick');
+      clone.querySelectorAll('[onclick]').forEach(n => n.removeAttribute('onclick'));
+      clone.querySelectorAll('[oninput]').forEach(n => n.removeAttribute('oninput'));
+      if (clone.tagName === 'BUTTON' || clone.tagName === 'INPUT') clone.disabled = true;
+      clone.querySelectorAll('button, input').forEach(n => { n.disabled = true; });
+      // Las posiciones originales (absolute/fixed) no aplican aquí —
+      // se neutralizan para que fluyan dentro del wrapper centrado.
+      clone.style.position = 'static';
+      clone.style.top = 'auto'; clone.style.left = 'auto';
+      clone.style.right = 'auto'; clone.style.bottom = 'auto';
+      clone.style.transform = 'none';
+      clone.style.margin = '0';
+      clone.style.display = clone.style.display === 'none' ? 'flex' : clone.style.display;
+      wrap.appendChild(clone);
+    });
+    target.appendChild(wrap);
+  }
+
+  function bigIcon(emoji) {
+    const el = document.createElement('div');
+    el.className = 't-bigicon';
+    el.textContent = emoji;
+    target.appendChild(el);
+  }
+
+  switch (idx) {
+    case 0: cloneReal(['.inicio-grid'], 0.62); break;            // bienvenida → vista general
+    case 1: cloneReal(['.env-grid', '#btn-start'], 0.78); break; // elegir ambiente + iniciar
+    case 2: cloneReal(['#hud-timer'], 1.3); break;                // timer Pomodoro
+    case 3: cloneReal(['#panel-right'], 0.85); break;             // control sensorial
+    case 4: bigIcon('🥽'); break;                                  // entrar en VR
+    case 5: cloneReal(['#pdf-viewer'], 0.85); break;              // lectura PDF
+    default: break;
+  }
+}
+
+function openTutorial() {
+  buildTutorialDots();
+  showTutorialSlide(0);
+  document.getElementById('tutorial-overlay').classList.add('on');
+}
+
+function closeTutorial() {
+  document.getElementById('tutorial-overlay').classList.remove('on');
+  document.getElementById('tutorial-bg-full').innerHTML = '';
+  try { localStorage.setItem(TUTORIAL_SEEN_KEY, '1'); } catch (e) {}
+}
+
+// ── State ──
+const S = {
+  env:'bosque', phase:'focus',
+  secs:FOCUS_DURATION, pomos:0, elapsed:0,
+  running:false, pausas:true, pauseSecs:BREAK_DURATION,
+  tick:null, elTick:null, pTick:null
+};
+
+// Configs de ambiente — referencias #id a los assets precargados
+const ENV = {
+  espacio:    { skyImg:'#sky-espacio',    rot:'0 0 0',    ambColor:'#080818', ambInt:0.3, dirColor:'#6080ff', dirInt:0.2, dot:'espacio',    lbl:'🌌 Espacio',    topLbl:'ESPACIO',    suelo:'#0d0d1f' },
+  bosque:     { skyImg:'#sky-bosque',     rot:'0 -90 0',  ambColor:'#1a2a1a', ambInt:0.7, dirColor:'#a0c8ff', dirInt:0.5, dot:'bosque',     lbl:'🌲 Bosque',     topLbl:'BOSQUE',     suelo:'#2d4a1e' },
+  biblioteca: { skyImg:'#sky-biblioteca', rot:'0 180 0',  ambColor:'#3a2010', ambInt:0.9, dirColor:'#ffcc80', dirInt:0.4, dot:'biblioteca', lbl:'📚 Biblioteca', topLbl:'BIBLIOTECA', suelo:'#5c3d1e' }
+};
+
+// Reloj top bar
+setInterval(()=>{
+  const d=new Date();
+  document.getElementById('tb-time').textContent =
+    d.getHours().toString().padStart(2,'0')+':'+d.getMinutes().toString().padStart(2,'0');
+}, 1000);
+
+// ── Regresar al inicio ──
+function goBack() {
+  const fd = document.getElementById('fade');
+  fd.style.opacity = '1'; fd.style.pointerEvents = 'all';
+  setTimeout(() => {
+    // Detener audio y timers
+    AudioSys.stop();
+    clearInterval(S.tick); clearInterval(S.elTick); clearInterval(S.pTick);
+    stopExerciseCycle();
+    S.running = false;
+
+    // Resetear estado
+    S.phase = 'focus'; S.secs = FOCUS_DURATION; S.pomos = 0; S.elapsed = 0;
+
+    // Resetear UI
+    [0,1,2,3].forEach(i => document.getElementById('d'+i)?.classList.remove('done'));
+    document.getElementById('prog-bar').style.width = '0%';
+    document.getElementById('pct').textContent = '0';
+    document.getElementById('cnt').textContent = '0';
+    document.getElementById('t-digits').textContent = fmtTime(FOCUS_DURATION);
+    document.getElementById('t-digits').classList.remove('urgent');
+    document.getElementById('elapsed').textContent = '00:00';
+    document.getElementById('el-time').textContent = '00:00';
+    document.getElementById('bpm').textContent = '72 BPM';
+    document.getElementById('asistente-msg').textContent = '"Bienvenido. Tu sesión de estudio ha comenzado. Mantén el enfoque."';
+
+    // Resetear brightness y overlay
+    document.getElementById('scene').style.filter = '';
+    document.getElementById('visor').style.opacity = '1';
+
+    // Cerrar pausa si está abierta
+    document.getElementById('screen-pause').classList.remove('on');
+
+    // Cerrar y resetear el visor de lectura — RF7
+    document.getElementById('pdf-viewer').classList.remove('on');
+    document.getElementById('pdf-viewer').style.width = '';
+    document.getElementById('pdf-viewer').style.height = '';
+    document.getElementById('pdf-viewer').style.maxHeight = '';
+    pdfPanelSizeIdx = 1;
+    document.getElementById('reader3d')?.setAttribute('visible', false);
+    document.getElementById('kodkod-metrics')?.setAttribute('visible', false);
+    PdfSys.reset();
+
+    // Mostrar pantalla de inicio
+    document.getElementById('hud').style.display = 'none';
+    document.getElementById('screen-inicio').style.display = 'flex';
+
+    fd.style.opacity = '0'; fd.style.pointerEvents = 'none';
+  }, 500);
+}
+
+// ── Control de Iluminación ──
+function setIluminacion(val) {
+  // brightness relativa: slider 60 = normal, 0 = muy oscuro, 100 = muy brillante
+  const brightness = (val / 60).toFixed(2);
+  document.getElementById('scene').style.filter = `brightness(${brightness})`;
+}
+
+// ── Control de Overlay (viñeta) ──
+function setOverlay(val) {
+  // 100 = viñeta completa, 0 = sin viñeta
+  document.getElementById('visor').style.opacity = (val / 100).toFixed(2);
+}
+
+// ── Configuración de la lectura asignada — RF7 ──
+// Coloca tu archivo PDF junto a index.html y ajusta el nombre/título aquí.
+const PDF_CONFIG = {
+  url:   'lectura.pdf',
+  title: '📖 La Odisea — Canto I'
+};
+
+// Tamaños preestablecidos del VISOR (la ventana completa, no el zoom del texto)
+const PDF_PANEL_SIZES = [
+  { w: 340, mh: 55 },  // 0 — pequeño
+  { w: 480, mh: 82 },  // 1 — mediano (por defecto)
+  { w: 640, mh: 88 },  // 2 — grande
+  { w: 820, mh: 92 }   // 3 — extra grande
+];
+let pdfPanelSizeIdx = 1;
+
+function pdfResizePanel(dir) {
+  pdfPanelSizeIdx = Math.min(PDF_PANEL_SIZES.length - 1, Math.max(0, pdfPanelSizeIdx + dir));
+  const cfg = PDF_PANEL_SIZES[pdfPanelSizeIdx];
+  const panel = document.getElementById('pdf-viewer');
+  panel.style.width = cfg.w + 'px';
+  panel.style.height = 'auto';
+  panel.style.maxHeight = cfg.mh + 'vh';
+  document.getElementById('pdf-panel-smaller').disabled = pdfPanelSizeIdx <= 0;
+  document.getElementById('pdf-panel-bigger').disabled  = pdfPanelSizeIdx >= PDF_PANEL_SIZES.length - 1;
+}
+
+// ── Sistema del visor de PDF (PDF.js) ──
+const PdfSys = {
+  doc: null,
+  pageNum: 1,
+  zoom_: 1.0,            // nivel de zoom VISUAL (100% = tamaño de referencia)
+  minZoom: 0.6,
+  maxZoom: 2.2,
+  renderScale: 1.8,       // resolución INTERNA fija del canvas — no cambia con el zoom
+  scrollPct: 0,           // 0 = inicio de página, 1 = final de página
+  lastCanvasW: 0,
+  lastCanvasH: 0,
+  rendering: false,
+  loaded: false,
+
+  init() {
+    if (window.pdfjsLib) {
+      pdfjsLib.GlobalWorkerOptions.workerSrc =
+        'vendor/pdf.worker.min.js';
+    }
+  },
+
+  load(url, title) {
+    this.init();
+    document.getElementById('pdf-title').textContent = title || PDF_CONFIG.title;
+    document.getElementById('pdf-loading').style.display = 'block';
+    document.getElementById('pdf-loading').textContent = 'Cargando documento…';
+    document.getElementById('pdf-canvas').style.display = 'none';
+
+    if (!window.pdfjsLib) {
+      this._error('No se pudo cargar el visor de PDF.');
+      return;
+    }
+
+    pdfjsLib.getDocument(url).promise.then(pdf => {
+      this.doc = pdf;
+      this.pageNum = 1;
+      this.loaded = true;
+      this.renderPage(1);
+    }).catch(err => {
+      console.warn('[PDF] No se pudo cargar', url, err);
+      this._error('No se encontró "' + url + '". Coloca el PDF junto a index.html.');
+    });
+  },
+
+  _error(msg) {
+    const el = document.getElementById('pdf-loading');
+    el.style.display = 'block';
+    el.textContent = msg;
+    el.style.color = 'rgba(255,140,140,0.85)';
+
+    const el3d = document.getElementById('reader3d-loading');
+    if (el3d) {
+      el3d.setAttribute('value', msg);
+      el3d.setAttribute('color', '#ff8080');
+      el3d.setAttribute('visible', true);
+    }
+  },
+
+  // IMPORTANTE: el canvas se dibuja SIEMPRE a una resolución interna fija
+  // (renderScale), independiente del zoom que elige el usuario. El "zoom"
+  // solo escala visualmente el resultado (CSS en 2D, tamaño de plano en
+  // 3D) sin volver a tocar canvas.width/height — cambiar esas propiedades
+  // borra el bitmap y corrompe la textura WebGL que usa el lector 3D
+  // (eso era exactamente lo que causaba la pantalla en blanco).
+  renderPage(num) {
+    if (!this.doc || this.rendering) return;
+    this.rendering = true;
+
+    // Red de seguridad: si por lo que sea ninguna promesa resuelve ni
+    // rechaza (p. ej. una excepción de WebGL que corta la cadena sin
+    // avisar — esto es lo que pasaba en VR), esto libera el candado a
+    // los 6s en vez de dejar la navegación bloqueada para siempre.
+    clearTimeout(this._renderWatchdog);
+    this._renderWatchdog = setTimeout(() => {
+      if (this.rendering) {
+        console.warn('[PDF] renderPage no terminó a tiempo — liberando candado de emergencia');
+        this.rendering = false;
+        this._error('No se pudo mostrar esta página. Intenta de nuevo.');
+      }
+    }, 6000);
+
+    const done = () => { clearTimeout(this._renderWatchdog); this.rendering = false; };
+
+    this.doc.getPage(num).then(page => {
+      const canvas = document.getElementById('pdf-canvas');
+      const ctx = canvas.getContext('2d');
+      const viewport = page.getViewport({ scale: this.renderScale });
+      const newW = Math.round(viewport.width);
+      const newH = Math.round(viewport.height);
+      const sizeChanged = (canvas.width !== newW || canvas.height !== newH);
+      canvas.width = newW;
+      canvas.height = newH;
+
+      page.render({ canvasContext: ctx, viewport }).promise.then(() => {
+        done();
+        document.getElementById('pdf-loading').style.display = 'none';
+        canvas.style.display = 'block';
+        this._applyZoomDisplay();
+        this._updateControls();
+        this._syncReader3D(sizeChanged);
+      }).catch(err => {
+        console.error('[PDF] Falló page.render():', err);
+        done();
+        this._error('No se pudo dibujar esta página. Intenta de nuevo.');
+      });
+    }).catch(err => {
+      console.error('[PDF] Falló getPage():', err);
+      done();
+      this._error('No se pudo cargar esta página. Intenta de nuevo.');
+    });
+  },
+
+  // Aplica el zoom visualmente: tamaño CSS del canvas en el panel 2D,
+  // y tamaño del plano en la escena 3D — el bitmap interno no cambia.
+  // ══════════════════════════════════════════════════════
+  // _applyZoomDisplay — dos comportamientos, una sola función:
+  //
+  //  2D (escritorio)  → zoom CSS clásico: el canvas crece y el
+  //    contenedor con scroll muestra la porción visible.
+  //
+  //  3D (VR)          → UV mapping de THREE.js: el plano SIEMPRE
+  //    cabe dentro del marco (no invade título ni botones), pero
+  //    texture.repeat controla cuánto de la página se muestra
+  //    (zoom) y texture.offset controla desde qué punto (scroll).
+  //    Así funciona como un lector real: haces zoom → el texto
+  //    se agranda → el plano muestra solo una parte de la página
+  //    → usas los botones ↑↓ (o el joystick) para desplazarte.
+  // ══════════════════════════════════════════════════════
+  _applyZoomDisplay() {
+    const canvas = document.getElementById('pdf-canvas');
+    if (!canvas.width || !canvas.height) return;
+    const aspect = canvas.height / canvas.width; // > 1 para páginas retrato
+
+    // ── 2D (escritorio): escala CSS, el div tiene overflow:auto ──
+    const baseCssW = 360;
+    canvas.style.width  = (baseCssW * this.zoom_) + 'px';
+    canvas.style.height = (baseCssW * this.zoom_ * aspect) + 'px';
+
+    // ── 3D (VR): plano fijo, zoom + scroll via UV ──
+    const planeEl = document.getElementById('pdf-plane-3d');
+    if (!planeEl) return;
+
+    // El plano cabe siempre dentro del área disponible entre el título
+    // y la barra de botones — sin importar el zoom ni el aspect ratio.
+    const MAX_W = 0.74, MAX_H = 1.16;
+    let planeW, planeH;
+    if (aspect <= MAX_H / MAX_W) { planeW = MAX_W; planeH = MAX_W * aspect; }
+    else                          { planeH = MAX_H; planeW = MAX_H / aspect; }
+    planeEl.setAttribute('width',  planeW.toFixed(4));
+    planeEl.setAttribute('height', planeH.toFixed(4));
+
+    // Zoom via texture.repeat:
+    //   rep = 1   → se ve toda la página (100% zoom)
+    //   rep = 0.5 → se ve la mitad de la página (200% zoom → texto 2× grande)
+    const rep = Math.max(0.1, Math.min(1, 1 / this.zoom_));
+
+    // Scroll via texture.offset (THREE.js: Y=0 = base canvas = final de página):
+    //   scrollPct=0 → inicio de página → offset.y = (1 - rep)
+    //   scrollPct=1 → final de página  → offset.y = 0
+    const offsetY = (1 - rep) * (1 - this.scrollPct);
+    const offsetX = (1 - rep) * 0.5; // centrado horizontalmente
+
+    const mesh = planeEl.getObject3D('mesh');
+    if (mesh && mesh.material && mesh.material.map) {
+      const tex = mesh.material.map;
+      tex.repeat.set(rep, rep);
+      tex.offset.set(offsetX, offsetY);
+      tex.needsUpdate = true;
+    }
+  },
+
+  // Desplaza la vista 3D del PDF en dirección vertical.
+  // dir: -1 = hacia arriba (inicio), +1 = hacia abajo (final).
+  scroll3d(dir) {
+    if (!this.loaded) return;
+    const rep    = 1 / this.zoom_;
+    const step   = 0.18 * rep;      // paso proporcional al zoom actual
+    this.scrollPct = Math.max(0, Math.min(1, this.scrollPct + dir * step));
+    this._applyZoomDisplay();
+    this._updateControls();
+  },
+
+  // Refleja el estado actual (página/zoom) en el lector 3D dentro de la
+  // escena. Si el tamaño del canvas cambió (página nueva), se reconstruye
+  // el material por completo en vez de solo marcar needsUpdate — esto
+  // evita el mismo bug de textura al cambiar de página.
+  _syncReader3D(forceRebuild) {
+    const planeEl = document.getElementById('pdf-plane-3d');
+    if (planeEl) {
+      if (forceRebuild) {
+        // Se difiere al siguiente frame: reconstruir el material justo en
+        // medio de un frame activo de WebXR es lo que causaba el bug de
+        // pantalla en blanco solo dentro del visor.
+        requestAnimationFrame(() => {
+          const mesh = planeEl.getObject3D('mesh');
+          if (mesh && mesh.material && mesh.material.map) mesh.material.map.dispose();
+          planeEl.removeAttribute('material');
+          planeEl.setAttribute('material', 'shader:flat; src:#pdf-canvas; transparent:true');
+        });
+      } else {
+        const mesh = planeEl.getObject3D('mesh');
+        if (mesh && mesh.material && mesh.material.map) mesh.material.map.needsUpdate = true;
+      }
+    }
+    const loadingTxt = document.getElementById('reader3d-loading');
+    if (loadingTxt) loadingTxt.setAttribute('visible', false);
+    const status = document.getElementById('reader3d-status');
+    if (status && this.doc) {
+      status.setAttribute('value',
+        'Pág. ' + this.pageNum + '/' + this.doc.numPages + ' · ' +
+        Math.round(this.zoom_ * 100) + '%');
+    }
+  },
+
+  _updateControls() {
+    document.getElementById('pdf-page-info').textContent = this.pageNum + ' / ' + this.doc.numPages;
+    document.getElementById('pdf-zoom-level').textContent = Math.round(this.zoom_ * 100) + '%';
+    document.getElementById('pdf-prev').disabled = this.pageNum <= 1;
+    document.getElementById('pdf-next').disabled = this.pageNum >= this.doc.numPages;
+    document.getElementById('pdf-zoom-out').disabled = this.zoom_ <= this.minZoom + 0.001;
+    document.getElementById('pdf-zoom-in').disabled = this.zoom_ >= this.maxZoom - 0.001;
+  },
+
+  zoom(delta) {
+    if (!this.loaded) return;
+    this.zoom_ = Math.min(this.maxZoom, Math.max(this.minZoom, this.zoom_ + delta));
+    this._applyZoomDisplay();
+    this._updateControls();
+    const status = document.getElementById('reader3d-status');
+    if (status && this.doc) {
+      status.setAttribute('value',
+        'Pág. ' + this.pageNum + '/' + this.doc.numPages + ' · ' +
+        Math.round(this.zoom_ * 100) + '%');
+    }
+  },
+
+  prevPage() {
+    if (!this.loaded || this.pageNum <= 1) return;
+    this.scrollPct = 0;              // volver al inicio de la página
+    this.pageNum--; this.renderPage(this.pageNum);
+  },
+
+  nextPage() {
+    if (!this.loaded || this.pageNum >= this.doc.numPages) return;
+    this.scrollPct = 0;              // volver al inicio de la página
+    this.pageNum++; this.renderPage(this.pageNum);
+  },
+
+  reset() {
+    this.doc = null; this.pageNum = 1; this.zoom_ = 1.0;
+    this.scrollPct = 0; this.loaded = false;
+  }
+};
+
+function pdfZoom(delta)    { PdfSys.zoom(delta); }
+function pdfPrevPage()     { PdfSys.prevPage(); }
+function pdfNextPage()     { PdfSys.nextPage(); }
+function pdfScroll3d(dir)  { PdfSys.scroll3d(dir); }
+
+function togglePdfViewer(show) {
+  const panel = document.getElementById('pdf-viewer');
+  if (show) {
+    panel.classList.add('on');
+    if (!PdfSys.loaded) PdfSys.load(PDF_CONFIG.url, PDF_CONFIG.title);
+  } else {
+    panel.classList.remove('on');
+  }
+}
+
+// ── Sistema de Audio — archivos MP3 reales ──
+const AudioSys = {
+  players: null,
+  current: 'silencio',
+  _vol: 0.4,
+
+  _init() {
+    if (this.players) return;
+    this.players = {
+      lofi:       new Audio('sonido-lofi.mp3'),
+      naturaleza: new Audio('sonido-naturaleza.mp3')
+    };
+    Object.values(this.players).forEach(p => {
+      p.loop   = true;
+      p.volume = this._vol;
+    });
+  },
+
+  stop() {
+    if (!this.players) return;
+    Object.values(this.players).forEach(p => { p.pause(); p.currentTime = 0; });
+  },
+
+  play(type) {
+    this._init();
+    this.stop();
+    this.current = type;
+    if (type === 'silencio') return;
+    const p = this.players[type];
+    if (p) p.play().catch(e => console.warn('[Audio] Autoplay bloqueado:', e));
+  },
+
+  setVolume(v) {
+    this._vol = v / 100;
+    if (this.players) Object.values(this.players).forEach(p => p.volume = this._vol);
+  }
+};
+
+function pickEnv(el) {
+  document.querySelectorAll('.env-card').forEach(c=>c.classList.remove('sel'));
+  el.classList.add('sel');
+  S.env = el.dataset.env;
+}
+
+function chip(el, grp) {
+  document.getElementById(grp).querySelectorAll('.chip').forEach(c=>c.classList.remove('on'));
+  el.classList.add('on');
+  // Guardar preferencia de sonido — se activa al presionar Iniciar Sesión
+  if (grp === 'c-snd') {
+    const t = el.textContent.trim();
+    if      (t === 'Lo-fi')      AudioSys.current = 'lofi';
+    else if (t === 'Naturaleza') AudioSys.current = 'naturaleza';
+    else                         AudioSys.current = 'silencio';
+  }
+}
+
+// ── Aplicar ambiente a la escena ──
+function applyEnv(env) {
+  const c = ENV[env];
+  const sky = document.getElementById('sky-el');
+
+  // Cargar panorámica directo por URL (sin sistema de assets — más fiable)
+  sky.setAttribute('src', c.skyImg);
+  sky.setAttribute('color', '#ffffff');
+  sky.setAttribute('rotation', c.rot);
+
+  // Iluminación
+  document.getElementById('l-amb').setAttribute('color', c.ambColor);
+  document.getElementById('l-amb').setAttribute('intensity', c.ambInt);
+  document.getElementById('l-dir').setAttribute('color', c.dirColor);
+  document.getElementById('l-dir').setAttribute('intensity', c.dirInt);
+
+  // Entidades de ambiente (3D decorativos)
+  ['espacio','biblioteca'].forEach(k =>
+    document.getElementById('env-'+k).setAttribute('visible', k === env));
+
+  // Piso — color según ambiente
+  document.getElementById('suelo-shared').setAttribute('color', c.suelo);
+
+  // HUD badge
+  document.getElementById('edot').className = 'env-dot ' + c.dot;
+  document.getElementById('env-label').textContent = c.lbl;
+  document.getElementById('tb-env').textContent = 'ENV: ' + c.topLbl;
+}
+
+// ── Iniciar sesión ──
+function startSession() {
+  const fd = document.getElementById('fade');
+  fd.style.opacity = '1'; fd.style.pointerEvents = 'all';
+  setTimeout(()=>{
+    applyEnv(S.env);
+    document.getElementById('screen-inicio').style.display = 'none';
+    document.getElementById('hud').style.display = 'block';
+    fd.style.opacity = '0'; fd.style.pointerEvents = 'none';
+    S.running = true;
+    startTick(); startElapsed();
+    updateAsistente(0);
+    // Iniciar sonido si fue preseleccionado
+    if (AudioSys.current !== 'silencio') AudioSys.play(AudioSys.current);
+    // Nota: la lectura ya NO se abre automáticamente aquí — ahora se
+    // accede haciendo clic en la pantalla de la laptop (ver "laptop-screen"
+    // y "reader3d"), tanto en escritorio como dentro del visor — RF7.
+  }, 500);
+}
+
+// ── Timer ──
+function startTick() {
+  clearInterval(S.tick);
+  S.tick = setInterval(()=>{ if(!S.running) return; S.secs--; renderTimer(); if(S.secs<=0) endPhase(); }, 1000);
+}
+
+function endPhase() {
+  clearInterval(S.tick);
+  if(S.phase==='focus') {
+    S.pomos = Math.min(S.pomos+1, 4);
+    markDot(S.pomos-1); updateProg();
+    updateAsistente(S.pomos);
+    if(S.pausas) enterPause(); else nextFocus();
+  } else resume();
+}
+
+// ── Ejercicios de pausa activa — RF4: reducción de fatiga ──
+// Pensados para hacerse sentado, sin movimientos bruscos de cabeza
+// (para no causar mareo si la persona sigue con el visor puesto).
+const EXERCISES = [
+  { title: 'Estira el cuello',     desc: 'Gira el cuello lentamente, 4 veces hacia cada lado.' },
+  { title: 'Relaja la vista',      desc: 'Mira un punto lejano 10s, luego uno cercano. Repite 3 veces.' },
+  { title: 'Hombros arriba',       desc: 'Encoge los hombros hacia las orejas y suelta. 5 veces.' },
+  { title: 'Gira el torso',        desc: 'Cruza los brazos y gira suavemente el torso a cada lado.' },
+  { title: 'Mueve las muñecas',    desc: 'Sacude las manos y gira las muñecas en círculos.' },
+  { title: 'Estira las piernas',   desc: 'Estira las piernas y flexiona los pies, 10 veces.' }
+];
+let _exerciseIdx = 0;
+let _exerciseTick = null;
+
+function showExercise(i) {
+  _exerciseIdx = i % EXERCISES.length;
+  const ex = EXERCISES[_exerciseIdx];
+  const counterLabel = 'Ejercicio ' + (_exerciseIdx + 1) + ' / ' + EXERCISES.length;
+
+  // Panel 2D — pantalla de pausa en escritorio
+  const t2d = document.getElementById('p-exercise-title');
+  const d2d = document.getElementById('p-exercise-desc');
+  if (t2d) t2d.textContent = ex.title;
+  if (d2d) d2d.textContent = ex.desc;
+
+  // Panel "KodKod sugiere" — junto al modelo en la escena
+  document.getElementById('ke-title')?.setAttribute('value', ex.title);
+  document.getElementById('ke-desc')?.setAttribute('value', ex.desc);
+  document.getElementById('ke-counter')?.setAttribute('value', counterLabel);
+
+  // Panel pause3d — siempre frente al usuario en VR (cámara hijo)
+  document.getElementById('p3d-ex-title')?.setAttribute('value', ex.title);
+  document.getElementById('p3d-ex-desc')?.setAttribute('value', ex.desc);
+  document.getElementById('p3d-ex-counter')?.setAttribute('value', counterLabel);
+
+  // KodKod hace un pequeño gesto de "estirarse" con cada indicación nueva
+  document.getElementById('modelo-glb')?.emit('kodkod-stretch');
+}
+
+function startExerciseCycle() {
+  showExercise(0);
+  document.getElementById('kodkod-exercise')?.setAttribute('visible', true);
+  document.getElementById('pause3d')?.setAttribute('visible', true);
+  clearInterval(_exerciseTick);
+  _exerciseTick = setInterval(() => showExercise(_exerciseIdx + 1), 20000);
+}
+
+function stopExerciseCycle() {
+  clearInterval(_exerciseTick);
+  document.getElementById('kodkod-exercise')?.setAttribute('visible', false);
+  document.getElementById('pause3d')?.setAttribute('visible', false);
+}
+
+function enterPause() {
+  S.phase='break'; S.pauseSecs=BREAK_DURATION;
+  document.getElementById('screen-pause').classList.add('on');
+  renderPause();
+  startExerciseCycle();
+  S.pTick = setInterval(()=>{
+    S.pauseSecs--;
+    renderPause();
+    if(S.pauseSecs<=0){ clearInterval(S.pTick); document.getElementById('screen-pause').classList.remove('on'); resume(); }
+  }, 1000);
+}
+
+function resume() {
+  clearInterval(S.pTick);
+  stopExerciseCycle();
+  document.getElementById('screen-pause').classList.remove('on');
+  nextFocus();
+}
+
+function nextFocus() {
+  S.phase='focus'; S.secs=FOCUS_DURATION; S.running=true; renderTimer(); startTick();
+}
+
+// ── Render ──
+function renderTimer() {
+  const el=document.getElementById('t-digits');
+  el.textContent=fmtTime(S.secs);
+  el.classList.toggle('urgent', S.secs<URGENT_THRESHOLD && S.phase==='focus');
+  document.getElementById('t-phase').textContent = S.phase==='focus' ? 'ENFOQUE' : 'PAUSA';
+}
+
+function renderPause() {
+  const t = fmtTime(S.pauseSecs);
+  document.getElementById('p-time').textContent = t;
+  // Actualizar también el timer en el panel 3D (visible en VR sin dom-overlay)
+  document.getElementById('p3d-timer')?.setAttribute('value', t);
+}
+
+function markDot(i){ document.getElementById('d'+i)?.classList.add('done'); }
+
+function updateProg() {
+  const p=Math.round(S.pomos/4*100);
+  document.getElementById('prog-bar').style.width=p+'%';
+  document.getElementById('pct').textContent=p;
+  document.getElementById('cnt').textContent=S.pomos;
+}
+
+function startElapsed() {
+  S.elTick = setInterval(()=>{
+    S.elapsed++;
+    const m=Math.floor(S.elapsed/60).toString().padStart(2,'0');
+    const s=(S.elapsed%60).toString().padStart(2,'0');
+    const t=m+':'+s;
+    document.getElementById('elapsed').textContent=t;
+    document.getElementById('el-time').textContent=t;
+    // Simular BPM ligeramente aleatorio
+    // NOTA: el ritmo cardiaco que muestra el prototipo es SIMULADO. No proviene de ningún sensor:
+    // es un número aleatorio entre 68 y 77 que se actualiza cada segundo. No se registró ni se analizó en el estudio.
+    const bpmVal = 68+Math.floor(Math.random()*10);
+    document.getElementById('bpm').textContent = bpmVal + ' BPM';
+    updateKodkodMetrics(t, bpmVal);
+  }, 1000);
+}
+
+// ── Panel de métricas de KodKod (clic sobre el modelo en la escena 3D) ──
+function updateKodkodMetrics(timeText, bpmVal) {
+  const elTime  = document.getElementById('km-time');
+  const elPhase = document.getElementById('km-phase');
+  const elPomos = document.getElementById('km-pomos');
+  const elBpm   = document.getElementById('km-bpm');
+  if (!elTime) return;
+  elTime.setAttribute('value', 'Tiempo activo: ' + timeText);
+  elPhase.setAttribute('value', 'Fase: ' + (S.phase === 'focus' ? 'Enfoque' : 'Pausa'));
+  elPomos.setAttribute('value', 'Pomodoros: ' + S.pomos + '/4');
+  if (bpmVal !== undefined) elBpm.setAttribute('value', 'Ritmo cardíaco: ' + bpmVal + ' BPM');
+}
+
+function toggleKodkodMetrics() {
+  const panel = document.getElementById('kodkod-metrics');
+  const show = !panel.getAttribute('visible');
+  panel.setAttribute('visible', show);
+  if (show) {
+    const m=Math.floor(S.elapsed/60).toString().padStart(2,'0');
+    const s=(S.elapsed%60).toString().padStart(2,'0');
+    updateKodkodMetrics(m+':'+s);
+  }
+}
+
+// ── Mensajes del asistente ──
+const MSG = [
+  '"Bienvenido. Tu sesión ha comenzado. Mantén el enfoque."',
+  '"¡Primer pomodoro completado! Llevas un buen ritmo."',
+  '"Vas muy bien, Luis. Dos bloques de trabajo completados."',
+  '"Tres pomodoros, excelente constancia. ¡Casi terminas!"',
+  '"¡Sesión completada! Lograste 4 bloques de concentración profunda."'
+];
+function updateAsistente(n) {
+  document.getElementById('asistente-msg').textContent = MSG[Math.min(n, MSG.length-1)];
+}
+
+// ── Inicialización al cargar el DOM ──
+document.addEventListener('DOMContentLoaded', () => {
+
+  // Tema claro/oscuro — se aplica antes que cualquier otra cosa para
+  // evitar el destello del tema equivocado al cargar.
+  ThemeSys.init();
+
+  // Tutorial de bienvenida — se muestra solo la primera vez.
+  // El botón "?" en la pantalla de inicio lo vuelve a abrir cuando se quiera.
+  let tutorialAlreadySeen = false;
+  try { tutorialAlreadySeen = !!localStorage.getItem(TUTORIAL_SEEN_KEY); } catch (e) {}
+  if (!tutorialAlreadySeen) openTutorial();
+
+  // Detección de carga del modelo 3D
+  const gltfEl = document.getElementById('modelo-glb');
+  if (gltfEl) {
+    gltfEl.addEventListener('model-loaded', () => {
+      console.log('[Modelo] GLB cargado correctamente');
+    });
+    gltfEl.addEventListener('model-error', () => {
+      console.warn('[Modelo] GLB no encontrado, usando placeholder holografico');
+    });
+  }
+
+  // AR Passthrough (Quest 3) — Realidad Mixta Selectiva
+  // El cielo 360° se mantiene; solo el área del escritorio muestra el mundo real.
+  const sceneEl = document.getElementById('scene');
+
+  // ── Lector de PDF en 3D — RF7 (no depende de dom-overlay) ──
+  // Clic en la pantalla de la laptop → muestra/oculta la "tablet" 3D.
+  const reader3d = document.getElementById('reader3d');
+
+  function toggle3DReader(forceShow) {
+    const show = forceShow !== undefined ? forceShow : !reader3d.getAttribute('visible');
+    console.log('[Lector3D] toggle ->', show);
+    reader3d.setAttribute('visible', show);
+    if (show) {
+      if (!PdfSys.loaded) {
+        document.getElementById('reader3d-loading').setAttribute('visible', true);
+        PdfSys.load(PDF_CONFIG.url, PDF_CONFIG.title);
+      } else {
+        // El PDF ya se había cargado antes (p. ej. desde el panel 2D) —
+        // solo hace falta refrescar la textura y ocultar "Cargando…",
+        // que es lo que se quedaba pegado antes de este arreglo.
+        console.log('[Lector3D] ya estaba cargado, sincronizando textura');
+        PdfSys._syncReader3D();
+      }
+    }
+  }
+
+  document.getElementById('laptop-screen').addEventListener('click', () => toggle3DReader());
+  document.getElementById('btn3d-zoom-out').addEventListener('click', () => { PdfSys.zoom(-0.05); });
+  document.getElementById('btn3d-zoom-in').addEventListener('click',  () => { PdfSys.zoom( 0.05); });
+  document.getElementById('btn3d-scroll-up').addEventListener('click', () => { console.log('[Lector3D] scroll^'); PdfSys.scroll3d(-1); });
+  document.getElementById('btn3d-scroll-dn').addEventListener('click', () => { console.log('[Lector3D] scrollv'); PdfSys.scroll3d( 1); });
+  document.getElementById('btn3d-prev').addEventListener('click',     () => { console.log('[Lector3D] prev');  PdfSys.prevPage(); });
+  document.getElementById('btn3d-next').addEventListener('click',     () => { console.log('[Lector3D] next');  PdfSys.nextPage(); });
+  document.getElementById('btn3d-close').addEventListener('click',    () => { console.log('[Lector3D] close'); toggle3DReader(false); });
+
+  // ── Scroll del joystick (Quest 3) — desplaza el PDF en VR ──
+  // thumbstickmoved.y: -1 = arriba, +1 = abajo
+  let _lastScrollTime = 0;
+  ['ctrl-left', 'ctrl-right'].forEach(id => {
+    const ctrl = document.getElementById(id);
+    if (!ctrl) return;
+    ctrl.addEventListener('thumbstickmoved', evt => {
+      if (!document.getElementById('reader3d').getAttribute('visible')) return;
+      const now = Date.now();
+      if (now - _lastScrollTime < 180) return;  // throttle: máx ~5 veces/seg
+      const y = evt.detail.y || 0;
+      if (Math.abs(y) < 0.35) return;           // dead zone
+      _lastScrollTime = now;
+      PdfSys.scroll3d(y > 0 ? 1 : -1);
+    });
+  });
+
+  // ── Botón 3D "Salir al Inicio" — siempre accesible, sin depender del HUD 2D ──
+  document.getElementById('btn3d-exit').addEventListener('click', () => {
+    console.log('[Lector3D] salir al inicio');
+    if (sceneEl.is('vr-mode')) sceneEl.exitVR();
+    goBack();
+  });
+
+  // ── Clic en KodKod — muestra/oculta el panel con tiempo y métricas ──
+  document.getElementById('kodkod-hitbox').addEventListener('click', () => {
+    console.log('[KodKod] clic — toggle métricas');
+    toggleKodkodMetrics();
+  });
+
+  // ── Botones del Quest 3 como "ESC de VR" ──
+  // B (control derecho) y Y (control izquierdo) son el estándar de
+  // "atrás/menú" en todas las apps de Quest — más natural que buscar
+  // un botón 3D dentro del entorno.
+  const exitVRIfActive = () => {
+    if (document.getElementById('scene').is('vr-mode')) {
+      console.log('[Quest] Botón B/Y → saliendo de VR');
+      document.getElementById('scene').exitVR();
+    }
+  };
+
+  // ── Lentes — toca para salir de VR ──
+  const exitVRNow = async () => {
+    console.log('[Lentes] intentando salir de VR...');
+    try {
+      const scene = document.getElementById('scene');
+      if (scene.xrSession) {
+        await scene.xrSession.end();
+      } else if (scene.is('vr-mode')) {
+        scene.exitVR();
+      }
+    } catch(e) {
+      console.warn('[Lentes] xrSession.end() falló:', e);
+      document.getElementById('scene').exitVR();
+    }
+  };
+  const glassesHitzone = document.getElementById('glasses-hitzone');
+  if (glassesHitzone) {
+    glassesHitzone.addEventListener('triggerdown', exitVRNow);
+    glassesHitzone.addEventListener('click',       exitVRNow);
+  }
+
+  // ── Botón B (control derecho) y Y (control izquierdo) para salir de VR ──
+  // Método 1: eventos A-Frame (bbuttondown / ybuttondown)
+  sceneEl.addEventListener('loaded', () => {
+    const right = document.getElementById('ctrl-right');
+    const left  = document.getElementById('ctrl-left');
+    if (right) right.addEventListener('bbuttondown', exitVRIfActive);
+    if (left)  left.addEventListener('ybuttondown',  exitVRIfActive);
+  });
+
+  // Método 2: Gamepad API — sondeo directo, más fiable en algunos firmwares.
+  // Botón índice 5 = B (mando derecho) / Y (mando izquierdo) en Quest.
+  let _gpPollId = null;
+  let _bPressedPrev = false;
+  sceneEl.addEventListener('enter-vr', () => {
+    _bPressedPrev = false;
+    _gpPollId = setInterval(() => {
+      if (!sceneEl.is('vr-mode')) { clearInterval(_gpPollId); return; }
+      const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+      for (const pad of pads) {
+        if (!pad || !pad.buttons) continue;
+        // btn[5] = B/Y en Quest 3 (Oculus layout)
+        const pressed = pad.buttons[5]?.pressed;
+        if (pressed && !_bPressedPrev) {
+          console.log('[Gamepad] B/Y presionado → salir VR');
+          clearInterval(_gpPollId);
+          sceneEl.exitVR();
+          return;
+        }
+        _bPressedPrev = !!pressed;
+      }
+    }, 80); // ~12 comprobaciones/seg, mínimo impacto en rendimiento
+  });
+  sceneEl.addEventListener('exit-vr', () => {
+    clearInterval(_gpPollId);
+    _bPressedPrev = false;
+  });
+
+  sceneEl.addEventListener('loaded', () => {
+    // El renderer debe limpiar con alpha=0 para que el compositor XR
+    // pueda mostrar el passthrough donde no hay geometría opaca.
+    sceneEl.renderer.setClearAlpha(0);
+    // El cielo 360° rinde en orden 0 (por defecto); el cutout en 999.
+    // Así el cutout sobreescribe correctamente el sky en la zona del escritorio.
+    const skyMesh = document.getElementById('sky-el').getObject3D('mesh');
+    if (skyMesh) skyMesh.renderOrder = 0;
+
+    // ── Mantener visible el HUD/visor de PDF en modo "pantalla completa" ──
+    // Por defecto A-Frame pone en fullscreen SOLO el <canvas> cuando no hay
+    // un visor real conectado (botón "Entrar en VR" en desktop). Eso saca
+    // de pantalla a todo lo demás (HUD, PDF, etc.) porque la API Fullscreen
+    // únicamente muestra el subárbol del elemento puesto en fullscreen.
+    // Redirigimos esa llamada para que sea #app-root (escena + HUD) el que
+    // entre en pantalla completa, en vez del canvas solo.
+    try {
+      const canvasEl = sceneEl.canvas;
+      const root = document.getElementById('app-root');
+      const rfs = root.requestFullscreen || root.webkitRequestFullscreen || root.mozRequestFullScreen;
+      if (canvasEl && rfs) {
+        const redirectFullscreen = function () { return rfs.call(root); };
+        canvasEl.requestFullscreen = redirectFullscreen;
+        canvasEl.webkitRequestFullscreen = redirectFullscreen;
+        canvasEl.mozRequestFullScreen = redirectFullscreen;
+      }
+    } catch (e) {
+      console.warn('[Fullscreen] No se pudo redirigir el canvas:', e);
+    }
+  });
+
+  sceneEl.addEventListener('enter-vr', () => {
+    const xr = sceneEl.xrSession;
+
+    // Diagnóstico — útil para depurar en el visor real (revisar con
+    // chrome://inspect conectado por USB, o el log del Meta Quest Browser).
+    console.log('[XR] Sesión iniciada. Modo:', xr?.mode || '(desconocido)',
+      '| environmentBlendMode:', xr?.environmentBlendMode,
+      '| domOverlayState:', xr?.domOverlayState,
+      '| domOverlayMode:', xr?.domOverlayMode);
+    if (!xr?.domOverlayState) {
+      console.warn('[XR] dom-overlay NO está activo en esta sesión — el HUD/PDF ' +
+        'no se podrá ver dentro del visor. Esto suele pasar en sesiones "immersive-vr" ' +
+        'puras; busca el botón "Entrar en RA" si aparece, en vez de "Entrar en VR".');
+    }
+
+    // Vista limpia: solo escena 3D (mesa, KodKod, entorno) + visor de PDF.
+    // El resto del HUD 2D (timer, paneles, badges, hint) se oculta —
+    // igual que se comportaba antes de agregar el lector de PDF.
+    document.body.classList.add('vr-clean');
+
+    if (xr && xr.environmentBlendMode === 'alpha-blend') {
+      console.log('[MR] Modo alpha-blend detectado — activando Realidad Mixta');
+
+      // 1. Renderer transparente: alpha=0 → el compositor muestra passthrough
+      sceneEl.renderer.setClearColor(new THREE.Color(0, 0, 0), 0);
+
+      // 2. Mostrar ventana de passthrough sobre el escritorio
+      document.getElementById('mr-cutout').setAttribute('visible', true);
+
+      // 3. Ocultar la superficie virtual del escritorio (ver el real debajo)
+      document.getElementById('desk-surface').setAttribute('visible', false);
+
+      // 4. Ocultar el piso virtual (el suelo real del usuario es el suelo)
+      document.getElementById('suelo-shared').setAttribute('visible', false);
+
+      // 5. Quitar viñeta del visor (innecesaria en XR nativo)
+      document.getElementById('visor').style.display = 'none';
+
+      // 6. Indicador MR en el HUD
+      document.getElementById('mr-pill').style.display = 'flex';
+
+    } else {
+      // Modo VR puro (sin passthrough — Quest 2 o similar)
+      console.log('[VR] Modo VR estándar — entorno 360° completo');
+      document.getElementById('visor').style.display = 'none';
+    }
+  });
+
+  sceneEl.addEventListener('exit-vr', () => {
+    console.log('[MR] Saliendo de XR — restaurando vista desktop');
+
+    // Restaurar todo el HUD 2D al salir de VR
+    document.body.classList.remove('vr-clean');
+
+    // Restaurar renderer opaco
+    sceneEl.renderer.setClearAlpha(1);
+    sceneEl.renderer.setClearColor(new THREE.Color(0, 0, 0), 1);
+
+    // Ocultar cutout y restaurar escritorio virtual
+    document.getElementById('mr-cutout').setAttribute('visible', false);
+    document.getElementById('desk-surface').setAttribute('visible', true);
+    document.getElementById('suelo-shared').setAttribute('visible', true);
+    document.getElementById('visor').style.display = 'block';
+    document.getElementById('mr-pill').style.display = 'none';
+  });
+
+  // ── Botón "Pantalla completa" — fullscreen de #app-root (escena + HUD) ──
+  // Independiente del botón "Entrar en VR" de A-Frame; garantiza que el
+  // HUD y el visor de PDF permanezcan visibles durante la prueba de
+  // usabilidad en escritorio, sin necesidad de un visor físico.
+  document.addEventListener('fullscreenchange', () => {
+    const btn = document.getElementById('btn-fullscreen');
+    const isFs = !!document.fullscreenElement;
+    btn.textContent = isFs ? '⛶' : '⛶';
+    btn.style.color = isFs ? 'var(--cyan)' : 'rgba(0,230,255,0.75)';
+    btn.title = isFs ? 'Salir de pantalla completa' : 'Pantalla completa';
+  });
+
+});
+
+function toggleFullscreen() {
+  const root = document.getElementById('app-root');
+  if (!document.fullscreenElement) {
+    const rfs = root.requestFullscreen || root.webkitRequestFullscreen || root.mozRequestFullScreen;
+    if (rfs) rfs.call(root).catch(err => console.warn('[Fullscreen] No se pudo activar:', err));
+  } else {
+    const efs = document.exitFullscreen || document.webkitExitFullscreen || document.mozCancelFullScreen;
+    if (efs) efs.call(document);
+  }
+}
+
+// ── Botón "Entrar en VR/RA" — un solo botón, modo correcto automático ──
+// La función dom-overlay (necesaria para ver el HUD/PDF DENTRO del visor)
+// solo se activa en sesiones "immersive-ar", no en "immersive-vr" puro.
+// Por eso, si el dispositivo soporta RA (como el Quest 3), SIEMPRE
+// preferimos entrar en ese modo — sin pedirle al usuario que elija.
+async function enterImmersive() {
+  const sceneEl = document.getElementById('scene');
+  if (!navigator.xr) {
+    // Sin WebXR disponible (ej. navegador de escritorio sin soporte) —
+    // usamos el modo VR normal de A-Frame (cae al fallback de pantalla
+    // completa que ya configuramos).
+    console.log('[XR] navigator.xr no disponible — entrando en modo VR plano');
+    return sceneEl.enterVR();
+  }
+  try {
+    const arOk = await navigator.xr.isSessionSupported('immersive-ar');
+    if (arOk) {
+      console.log('[XR] Realidad Aumentada soportada — entrando en modo RA (con dom-overlay)');
+      return sceneEl.enterAR();
+    }
+  } catch (e) {
+    console.warn('[XR] No se pudo verificar soporte de RA:', e);
+  }
+  console.log('[XR] RA no disponible — entrando en modo VR estándar');
+  sceneEl.enterVR();
+}
+</script>
+</body>
+</html>

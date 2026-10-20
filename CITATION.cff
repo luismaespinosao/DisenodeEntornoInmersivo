@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+message: "Si usas este material, cítalo como se indica."
+title: "Entorno de Estudio: prototipo de realidad virtual para mejorar la atención en estudiantes universitarios"
+type: software
+authors:
+  - family-names: "Espinosa Ortiz"
+    given-names: "Luis Mario"
+    affiliation: "Universidad Tecnológica de la Mixteca"
+version: "1.0.0"
+date-released: "2026-10-19"
+license: MIT
+# PENDIENTE: agregar `doi` (Zenodo) y `repository-code` cuando se publique el repositorio.
